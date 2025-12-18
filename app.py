@@ -22,7 +22,6 @@ PLANETS = {
     'pluto': swe.PLUTO,
     'north_node': swe.TRUE_NODE,
     'chiron': swe.CHIRON,
-    'lilith': swe.MEAN_APOG,
 }
 
 PLANET_NAMES = {
@@ -38,7 +37,6 @@ PLANET_NAMES = {
     'pluto': 'Plutón',
     'north_node': 'Nodo Norte',
     'chiron': 'Quirón',
-    'lilith': 'Lilith',
 }
 
 SIGNS = [
