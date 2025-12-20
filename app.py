@@ -9,8 +9,12 @@ app = Flask(__name__)
 CORS(app)
 
 def _resolve_ephe_path() -> str:
-    # Railway/Docker friendly: allow overriding via env var.
-    # Default: /app/ephe (copied in Dockerfile).
+    """
+    Resolve ephemeris path in order of priority:
+    1. Environment variable EPHE_PATH
+    2. Docker default /app/ephe
+    3. Local ephe directory
+    """
     env_path = os.environ.get("EPHE_PATH")
     if env_path:
         return env_path
@@ -25,6 +29,7 @@ EPHE_PATH = _resolve_ephe_path()
 swe.set_ephe_path(EPHE_PATH)
 
 def _log_ephe_status():
+    """Log ephemeris path and file status on startup"""
     try:
         files = []
         if os.path.isdir(EPHE_PATH):
@@ -33,7 +38,7 @@ def _log_ephe_status():
         if files:
             print(f"[ephe] Sample files: {files[:10]}")
         else:
-            print("[ephe] WARNING: No ephemeris files found. Outer bodies may work, but Chiron/Lilith can be missing.")
+            print("[ephe] WARNING: No ephemeris files found. Outer bodies may work, but Chiron can be missing.")
     except Exception as e:
         print(f"[ephe] ERROR reading EPHE_PATH={EPHE_PATH}: {e}")
 
@@ -75,7 +80,7 @@ SIGNS = [
 ]
 
 def get_sign(longitude):
-    """Get zodiac sign from longitude"""
+    """Get zodiac sign and degree from ecliptic longitude"""
     normalized_lon = longitude % 360
     if normalized_lon < 0:
         normalized_lon += 360
@@ -115,7 +120,7 @@ def convert_local_to_utc(year, month, day, hour, minute, timezone_str):
         # Convert to UTC
         utc_dt = local_dt.astimezone(pytz.UTC)
         
-        print(f"Local time: {local_dt.strftime('%Y-%m-%d %H:%M %Z')} -> UTC: {utc_dt.strftime('%Y-%m-%d %H:%M %Z')}")
+        print(f"[time] Local: {local_dt.strftime('%Y-%m-%d %H:%M %Z')} -> UTC: {utc_dt.strftime('%Y-%m-%d %H:%M %Z')}")
         
         return (
             utc_dt.year,
@@ -125,7 +130,7 @@ def convert_local_to_utc(year, month, day, hour, minute, timezone_str):
             utc_dt.minute + utc_dt.second / 60.0
         )
     except Exception as e:
-        print(f"Error converting timezone: {e}. Using input time as UTC.")
+        print(f"[time] ERROR converting timezone: {e}. Using input time as UTC.")
         return (year, month, day, hour, minute)
 
 def calculate_julian_day(year, month, day, hour, minute):
@@ -135,7 +140,7 @@ def calculate_julian_day(year, month, day, hour, minute):
     return jd
 
 def calculate_planet_position(julian_day, planet_id):
-    """Calculate planet position"""
+    """Calculate planet position using Swiss Ephemeris"""
     try:
         result = swe.calc_ut(julian_day, planet_id, swe.FLG_SWIEPH | swe.FLG_SPEED)
         longitude = result[0][0]
@@ -154,7 +159,7 @@ def calculate_planet_position(julian_day, planet_id):
             **sign_info
         }
     except Exception as e:
-        print(f"Error calculating planet {planet_id}: {e}")
+        print(f"[calc] ERROR calculating planet {planet_id}: {e}")
         return None
 
 def calculate_houses(julian_day, latitude, longitude):
@@ -209,7 +214,7 @@ def calculate_houses(julian_day, latitude, longitude):
             }
         }
     except Exception as e:
-        print(f"Error calculating houses: {e}")
+        print(f"[calc] ERROR calculating houses: {e}")
         return None
 
 def get_house_for_planet(planet_longitude, houses):
@@ -230,47 +235,75 @@ def get_house_for_planet(planet_longitude, houses):
     
     return 1  # Default to house 1 if not found
 
+def normalize_angle(angle):
+    """Normalize angle to -180 to +180 range"""
+    angle = angle % 360
+    if angle > 180:
+        angle -= 360
+    return angle
+
 def is_aspect_applying(planet1_lon, planet1_speed, planet2_lon, planet2_speed, aspect_angle):
     """
     Determine if an aspect is applying (A) or separating (S).
-    An aspect is applying when the faster planet is moving toward the exact aspect.
-    """
-    # Calculate the current angular distance
-    diff = planet1_lon - planet2_lon
-    if diff < 0:
-        diff += 360
-    if diff > 180:
-        diff = 360 - diff
+    An aspect is applying when planets are moving toward exactitude.
     
-    # Calculate relative speed (positive means planet1 is moving faster toward planet2)
+    Args:
+        planet1_lon: Longitude of first planet (degrees)
+        planet1_speed: Speed of first planet (degrees/day)
+        planet2_lon: Longitude of second planet (degrees)
+        planet2_speed: Speed of second planet (degrees/day)
+        aspect_angle: Exact angle of the aspect (0, 60, 90, 120, 180)
+    
+    Returns:
+        str: 'A' for applying, 'S' for separating
+    """
+    # Current angular difference (normalized to -180 to +180)
+    current_diff = normalize_angle(planet1_lon - planet2_lon)
+    
+    # Relative speed (positive if planet1 is catching up)
     relative_speed = planet1_speed - planet2_speed
     
     # Calculate distance to exact aspect
-    distance_to_exact = abs(diff - aspect_angle)
+    if aspect_angle == 0:  # Conjunction
+        current_distance = abs(current_diff)
+    elif aspect_angle == 180:  # Opposition
+        current_distance = abs(abs(current_diff) - 180)
+    else:  # Trine (120), Square (90), Sextile (60)
+        # Find minimum distance to aspect (could be ± aspect_angle)
+        dist_positive = abs(current_diff - aspect_angle)
+        dist_negative = abs(current_diff + aspect_angle)
+        current_distance = min(dist_positive, dist_negative)
     
-    # Future position after a small time increment
-    future_diff = (planet1_lon + planet1_speed * 0.1) - (planet2_lon + planet2_speed * 0.1)
-    if future_diff < 0:
-        future_diff += 360
-    if future_diff > 180:
-        future_diff = 360 - future_diff
+    # Calculate future position (0.1 days = ~2.4 hours ahead)
+    future_diff = normalize_angle(
+        (planet1_lon + relative_speed * 0.1) - planet2_lon
+    )
     
-    future_distance = abs(future_diff - aspect_angle)
+    # Calculate future distance to exact aspect
+    if aspect_angle == 0:
+        future_distance = abs(future_diff)
+    elif aspect_angle == 180:
+        future_distance = abs(abs(future_diff) - 180)
+    else:
+        dist_positive = abs(future_diff - aspect_angle)
+        dist_negative = abs(future_diff + aspect_angle)
+        future_distance = min(dist_positive, dist_negative)
     
-    # If future distance is smaller, the aspect is applying
-    return 'A' if future_distance < distance_to_exact else 'S'
+    # Aspect is applying if future distance is smaller
+    return 'A' if future_distance < current_distance else 'S'
 
 def calculate_aspects(planets, ascendant_lon=None, mc_lon=None):
     """Calculate aspects between planets and to angles"""
     aspects = []
     planet_keys = list(planets.keys())
     
+    # Traditional orbs
     aspect_orbs = {
         'conjunction': {'angle': 0, 'orb': 8, 'name': 'Conjunción'},
         'opposition': {'angle': 180, 'orb': 8, 'name': 'Oposición'},
         'trine': {'angle': 120, 'orb': 8, 'name': 'Trígono'},
         'square': {'angle': 90, 'orb': 8, 'name': 'Cuadratura'},
-        'sextile': {'angle': 60, 'orb': 6, 'name': 'Sextil'},
+        'sextile': {'angle': 60, 'orb': 4, 'name': 'Sextil'},
     }
     
     # Aspects between planets
@@ -287,10 +320,12 @@ def calculate_aspects(planets, ascendant_lon=None, mc_lon=None):
             speed1 = planets[planet1_key].get('speed', 0)
             speed2 = planets[planet2_key].get('speed', 0)
             
+            # Calculate angular separation
             diff = abs(lon1 - lon2)
             if diff > 180:
                 diff = 360 - diff
             
+            # Check each aspect type
             for aspect_type, aspect_data in aspect_orbs.items():
                 orb = abs(diff - aspect_data['angle'])
                 if orb <= aspect_data['orb']:
@@ -367,9 +402,198 @@ def health():
     """Health check endpoint"""
     return jsonify({'status': 'healthy', 'service': 'swiss-ephemeris'})
 
+@app.route('/debug/ephe', methods=['GET'])
+def debug_ephe():
+    """Debug endpoint to check ephemeris files"""
+    ephe_path = _resolve_ephe_path()
+    files = []
+    if os.path.isdir(ephe_path):
+        files = sorted(os.listdir(ephe_path))
+    
+    # Test Chiron calculation
+    chiron_test = None
+    try:
+        # Test with a known date (2000-01-01 12:00 UT)
+        jd = swe.julday(2000, 1, 1, 12.0)
+        result = swe.calc_ut(jd, swe.CHIRON, swe.FLG_SWIEPH | swe.FLG_SPEED)
+        chiron_test = {
+            'status': 'success',
+            'longitude': round(result[0][0], 6),
+            'sign': get_sign(result[0][0])['sign']
+        }
+    except Exception as e:
+        chiron_test = {
+            'status': 'error',
+            'message': str(e)
+        }
+    
+    return jsonify({
+        'ephe_path': ephe_path,
+        'files': files,
+        'file_count': len(files),
+        'chiron_test': chiron_test,
+        'expected_files': ['seas_18.se1', 'sepl_18.se1']
+    })
+
+def calculate_progressed_moon(birth_jd, current_date_str):
+    """
+    Calculate Secondary Progression for the Moon.
+    Secondary Progression: 1 day after birth = 1 year of life
+    
+    Args:
+        birth_jd: Julian Day of birth
+        current_date_str: Current date in YYYY-MM-DD format
+    
+    Returns:
+        dict with progressed Moon position and info
+    """
+    try:
+        # Parse current date
+        current_year, current_month, current_day = map(int, current_date_str.split('-'))
+        current_jd = swe.julday(current_year, current_month, current_day, 12.0)
+        
+        # Calculate years since birth
+        days_since_birth = current_jd - birth_jd
+        years_since_birth = days_since_birth / 365.25
+        
+        # Progressed date: birth + (years as days)
+        # Each year of life = 1 day after birth
+        progressed_jd = birth_jd + years_since_birth
+        
+        # Calculate Moon position at progressed date
+        moon_position = calculate_planet_position(progressed_jd, swe.MOON)
+        
+        if not moon_position:
+            return None
+        
+        # Calculate when Moon will change sign (approximate)
+        moon_speed_per_year = 12.2  # Moon moves ~12.2 degrees per progressed year
+        degrees_to_next_sign = 30 - (moon_position['longitude'] % 30)
+        years_to_sign_change = degrees_to_next_sign / moon_speed_per_year
+        
+        # Previous sign
+        prev_sign_index = (SIGNS.index(moon_position['sign']) - 1) % 12
+        
+        return {
+            'name': 'Luna Progresada',
+            'longitude': moon_position['longitude'],
+            'sign': moon_position['sign'],
+            'degree': moon_position['degree'],
+            'degree_dms': moon_position['degree_dms'],
+            'previousSign': SIGNS[prev_sign_index],
+            'yearsToSignChange': round(years_to_sign_change, 1),
+            'progressedJulianDay': round(progressed_jd, 6),
+            'yearsSinceBirth': round(years_since_birth, 2)
+        }
+    except Exception as e:
+        print(f"[calc] ERROR calculating progressed Moon: {e}")
+        return None
+
+def calculate_solar_return(birth_jd, birth_sun_longitude, current_year, sr_latitude, sr_longitude):
+    """
+    Calculate Solar Return chart for a given year.
+    Solar Return is when the Sun returns to its exact natal position.
+    
+    Args:
+        birth_jd: Julian Day of birth (for reference)
+        birth_sun_longitude: Natal Sun longitude in degrees
+        current_year: Year for which to calculate SR
+        sr_latitude: Latitude where the birthday is spent
+        sr_longitude: Longitude where the birthday is spent
+    
+    Returns:
+        dict with Solar Return chart data
+    """
+    try:
+        # Start searching from January 1 of the target year
+        search_jd = swe.julday(current_year, 1, 1, 12.0)
+        
+        # Find when Sun returns to natal position (within 1 degree tolerance to start)
+        # Binary search for exact moment
+        low_jd = search_jd
+        high_jd = search_jd + 366  # Search within one year
+        
+        target_longitude = birth_sun_longitude
+        
+        # Iterative refinement
+        for _ in range(50):  # Max iterations
+            mid_jd = (low_jd + high_jd) / 2
+            sun_pos = swe.calc_ut(mid_jd, swe.SUN, swe.FLG_SWIEPH)[0][0]
+            
+            # Normalize difference
+            diff = sun_pos - target_longitude
+            if diff > 180:
+                diff -= 360
+            elif diff < -180:
+                diff += 360
+            
+            if abs(diff) < 0.0001:  # Very precise
+                break
+            
+            if diff > 0:
+                high_jd = mid_jd
+            else:
+                low_jd = mid_jd
+        
+        sr_jd = mid_jd
+        
+        # Calculate houses for SR location
+        sr_houses = calculate_houses(sr_jd, sr_latitude, sr_longitude)
+        if not sr_houses:
+            return None
+        
+        # Calculate all planets at SR moment
+        sr_planets = {}
+        for planet_key, planet_id in PLANETS.items():
+            position = calculate_planet_position(sr_jd, planet_id)
+            if position:
+                house_num = get_house_for_planet(position['longitude'], sr_houses['houses'])
+                sr_planets[planet_key] = {
+                    'name': PLANET_NAMES[planet_key],
+                    'house': house_num,
+                    **position
+                }
+        
+        # Calculate aspects in SR
+        sr_aspects = calculate_aspects(
+            sr_planets,
+            ascendant_lon=sr_houses['ascendant']['longitude'],
+            mc_lon=sr_houses['mc']['longitude']
+        )
+        
+        # Convert SR Julian Day back to calendar date
+        sr_date = swe.revjul(sr_jd)
+        sr_date_str = f"{int(sr_date[0])}-{int(sr_date[1]):02d}-{int(sr_date[2]):02d}"
+        sr_time_decimal = (sr_jd % 1) * 24
+        sr_hour = int(sr_time_decimal)
+        sr_minute = int((sr_time_decimal - sr_hour) * 60)
+        sr_time_str = f"{sr_hour:02d}:{sr_minute:02d}"
+        
+        return {
+            'year': current_year,
+            'exactMoment': {
+                'julianDay': round(sr_jd, 6),
+                'date': sr_date_str,
+                'time': sr_time_str
+            },
+            'planets': sr_planets,
+            'houses': sr_houses['houses'],
+            'ascendant': sr_houses['ascendant'],
+            'mc': sr_houses['mc'],
+            'location': {
+                'latitude': sr_latitude,
+                'longitude': sr_longitude
+            }
+        }
+    except Exception as e:
+        print(f"[calc] ERROR calculating Solar Return: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 @app.route('/calculate', methods=['POST'])
 def calculate_natal_chart():
-    """Calculate natal chart"""
+    """Calculate natal chart from birth data"""
     try:
         data = request.get_json()
         
@@ -380,32 +604,40 @@ def calculate_natal_chart():
         longitude = float(data.get('longitude'))
         timezone = data.get('timezone', 'UTC')
         
+        # Optional: Solar Return location (if different from birth)
+        sr_latitude = data.get('solarReturnLatitude', latitude)
+        sr_longitude = data.get('solarReturnLongitude', longitude)
+        include_progressions = data.get('includeProgressions', True)
+        include_solar_return = data.get('includeSolarReturn', True)
+        
         # Parse date and time (LOCAL)
         year, month, day = map(int, birth_date.split('-'))
         hour, minute = map(int, birth_time.split(':'))
         
-        print(f"Input LOCAL time: {year}-{month}-{day} {hour}:{minute} ({timezone}) at lat={latitude}, lon={longitude}")
+        print(f"[calc] Input LOCAL time: {year}-{month:02d}-{day:02d} {hour:02d}:{minute:02d} ({timezone})")
+        print(f"[calc] Coordinates: lat={latitude}, lon={longitude}")
         
         # Convert local time to UTC for ephemeris calculations
         utc_year, utc_month, utc_day, utc_hour, utc_minute = convert_local_to_utc(
             year, month, day, hour, minute, timezone
         )
         
-        print(f"Converted to UTC: {utc_year}-{utc_month}-{utc_day} {utc_hour}:{utc_minute:.2f}")
+        print(f"[calc] Converted to UTC: {utc_year}-{utc_month:02d}-{utc_day:02d} {int(utc_hour):02d}:{utc_minute:05.2f}")
         
         # Calculate Julian Day using UTC time
         julian_day = calculate_julian_day(utc_year, utc_month, utc_day, utc_hour, utc_minute)
-        print(f"Julian Day (UT): {julian_day}")
+        print(f"[calc] Julian Day: {julian_day:.6f}")
         
         # Calculate houses first (needed for planet house placement)
         houses_data = calculate_houses(julian_day, latitude, longitude)
         if not houses_data:
             return jsonify({'error': 'Failed to calculate houses'}), 500
         
-        print("Houses calculated")
+        print(f"[calc] Houses calculated successfully")
         
         # Calculate planets with house placement
         planets = {}
+        failed_planets = []
         for planet_key, planet_id in PLANETS.items():
             position = calculate_planet_position(julian_day, planet_id)
             if position:
@@ -416,8 +648,13 @@ def calculate_natal_chart():
                     'house': house_num,
                     **position
                 }
+            else:
+                failed_planets.append(planet_key)
+                print(f"[calc] WARNING: Failed to calculate {planet_key}")
         
-        print(f"Calculated {len(planets)} planets")
+        print(f"[calc] Calculated {len(planets)}/{len(PLANETS)} planets successfully")
+        if failed_planets:
+            print(f"[calc] FAILED planets: {failed_planets}")
         
         # Calculate aspects (including to angles)
         aspects = calculate_aspects(
@@ -425,9 +662,9 @@ def calculate_natal_chart():
             ascendant_lon=houses_data['ascendant']['longitude'],
             mc_lon=houses_data['mc']['longitude']
         )
-        print(f"Calculated {len(aspects)} aspects")
+        print(f"[calc] Calculated {len(aspects)} aspects")
         
-        # Prepare response
+        # Prepare base response
         chart_data = {
             'birthInfo': {
                 'date': birth_date,
@@ -449,14 +686,38 @@ def calculate_natal_chart():
             'ephemeris': 'Swiss Ephemeris'
         }
         
+        # Calculate Progressed Moon (Secondary Progression)
+        if include_progressions:
+            current_date = datetime.utcnow().strftime('%Y-%m-%d')
+            progressed_moon = calculate_progressed_moon(julian_day, current_date)
+            if progressed_moon:
+                chart_data['progressedMoon'] = progressed_moon
+                print(f"[calc] Progressed Moon: {progressed_moon['sign']} {progressed_moon['degree_dms']}")
+        
+        # Calculate Solar Return for current year
+        if include_solar_return and planets.get('sun'):
+            current_year = datetime.utcnow().year
+            natal_sun_longitude = planets['sun']['longitude']
+            solar_return = calculate_solar_return(
+                julian_day, 
+                natal_sun_longitude, 
+                current_year,
+                float(sr_latitude),
+                float(sr_longitude)
+            )
+            if solar_return:
+                chart_data['solarReturn'] = solar_return
+                print(f"[calc] Solar Return {current_year}: ASC {solar_return['ascendant']['sign']}")
+        
         return jsonify({'success': True, 'chartData': chart_data})
         
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"[calc] ERROR: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
+    print(f"[server] Starting Flask server on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
