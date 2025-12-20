@@ -607,6 +607,7 @@ def calculate_natal_chart():
         # Optional: Solar Return location (if different from birth)
         sr_latitude = data.get('solarReturnLatitude', latitude)
         sr_longitude = data.get('solarReturnLongitude', longitude)
+        sr_year = data.get('solarReturnYear', datetime.utcnow().year)
         include_progressions = data.get('includeProgressions', True)
         include_solar_return = data.get('includeSolarReturn', True)
         
@@ -694,20 +695,19 @@ def calculate_natal_chart():
                 chart_data['progressedMoon'] = progressed_moon
                 print(f"[calc] Progressed Moon: {progressed_moon['sign']} {progressed_moon['degree_dms']}")
         
-        # Calculate Solar Return for current year
+        # Calculate Solar Return for specified year
         if include_solar_return and planets.get('sun'):
-            current_year = datetime.utcnow().year
             natal_sun_longitude = planets['sun']['longitude']
             solar_return = calculate_solar_return(
                 julian_day, 
                 natal_sun_longitude, 
-                current_year,
+                int(sr_year),
                 float(sr_latitude),
                 float(sr_longitude)
             )
             if solar_return:
                 chart_data['solarReturn'] = solar_return
-                print(f"[calc] Solar Return {current_year}: ASC {solar_return['ascendant']['sign']}")
+                print(f"[calc] Solar Return {sr_year}: ASC {solar_return['ascendant']['sign']}")
         
         return jsonify({'success': True, 'chartData': chart_data})
         
