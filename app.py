@@ -56,6 +56,7 @@ PLANETS = {
     'neptune': swe.NEPTUNE,
     'pluto': swe.PLUTO,
     'north_node': swe.TRUE_NODE,
+    'south_node': None,  # Calculated as opposite of North Node
     'chiron': swe.CHIRON,
 }
 
@@ -71,6 +72,7 @@ PLANET_NAMES = {
     'neptune': 'Neptuno',
     'pluto': 'Plutón',
     'north_node': 'Nodo Norte',
+    'south_node': 'Nodo Sur',
     'chiron': 'Quirón',
 }
 
@@ -639,7 +641,13 @@ def calculate_natal_chart():
         # Calculate planets with house placement
         planets = {}
         failed_planets = []
+        north_node_position = None  # Store for calculating South Node
+        
         for planet_key, planet_id in PLANETS.items():
+            # Skip south_node for now, calculate after north_node
+            if planet_key == 'south_node':
+                continue
+                
             position = calculate_planet_position(julian_day, planet_id)
             if position:
                 # Add house placement
@@ -649,9 +657,28 @@ def calculate_natal_chart():
                     'house': house_num,
                     **position
                 }
+                # Store north node position for south node calculation
+                if planet_key == 'north_node':
+                    north_node_position = position
             else:
                 failed_planets.append(planet_key)
                 print(f"[calc] WARNING: Failed to calculate {planet_key}")
+        
+        # Calculate South Node as opposite of North Node (180° apart)
+        if north_node_position:
+            south_lon = (north_node_position['longitude'] + 180) % 360
+            south_sign_info = get_sign(south_lon)
+            south_house = get_house_for_planet(south_lon, houses_data['houses'])
+            planets['south_node'] = {
+                'name': PLANET_NAMES['south_node'],
+                'house': south_house,
+                'longitude': round(south_lon, 6),
+                'latitude': round(-north_node_position['latitude'], 6),  # Opposite latitude
+                'distance': north_node_position['distance'],
+                'speed': north_node_position['speed'],  # Same speed as north node
+                'degree_dms': format_dms(south_sign_info['degree']),
+                **south_sign_info
+            }
         
         print(f"[calc] Calculated {len(planets)}/{len(PLANETS)} planets successfully")
         if failed_planets:
