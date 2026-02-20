@@ -593,6 +593,190 @@ def calculate_solar_return(birth_jd, birth_sun_longitude, current_year, sr_latit
         traceback.print_exc()
         return None
 
+
+# ============ TRANSIT CALCULATION ============
+
+# Orbs for transit aspects (tighter than natal)
+TRANSIT_ORBS = {
+    'sun':       {'conjunction': 1, 'opposition': 1, 'trine': 1, 'square': 1, 'sextile': 1},
+    'moon':      {'conjunction': 1, 'opposition': 1, 'trine': 1, 'square': 1, 'sextile': 1},
+    'mercury':   {'conjunction': 2, 'opposition': 2, 'trine': 2, 'square': 2, 'sextile': 1},
+    'venus':     {'conjunction': 2, 'opposition': 2, 'trine': 2, 'square': 2, 'sextile': 1},
+    'mars':      {'conjunction': 2, 'opposition': 2, 'trine': 2, 'square': 2, 'sextile': 1},
+    'jupiter':   {'conjunction': 4, 'opposition': 4, 'trine': 4, 'square': 4, 'sextile': 2},
+    'saturn':    {'conjunction': 4, 'opposition': 4, 'trine': 4, 'square': 4, 'sextile': 2},
+    'uranus':    {'conjunction': 4, 'opposition': 4, 'trine': 4, 'square': 4, 'sextile': 2},
+    'neptune':   {'conjunction': 4, 'opposition': 4, 'trine': 4, 'square': 4, 'sextile': 2},
+    'pluto':     {'conjunction': 4, 'opposition': 4, 'trine': 4, 'square': 4, 'sextile': 2},
+    'north_node':{'conjunction': 2, 'opposition': 2, 'trine': 2, 'square': 2, 'sextile': 1},
+    'chiron':    {'conjunction': 3, 'opposition': 3, 'trine': 3, 'square': 3, 'sextile': 2},
+}
+
+TRANSIT_ASPECT_DEFS = [
+    {'key': 'conjunction', 'angle': 0,   'name': 'Conjunción'},
+    {'key': 'opposition',  'angle': 180, 'name': 'Oposición'},
+    {'key': 'trine',       'angle': 120, 'name': 'Trígono'},
+    {'key': 'square',      'angle': 90,  'name': 'Cuadratura'},
+    {'key': 'sextile',     'angle': 60,  'name': 'Sextil'},
+]
+
+def calculate_transits(natal_planets_data, target_date_str=None, latitude=None, longitude=None):
+    """
+    Calculate current transiting planets and their aspects to natal chart.
+    
+    Args:
+        natal_planets_data: dict of natal planets with longitude values
+        target_date_str: date string YYYY-MM-DD (default: today UTC)
+        latitude: for natal house placement of transiting planets
+        longitude: for natal house placement of transiting planets
+    
+    Returns:
+        dict with transitPlanets, transitAspects, date
+    """
+    try:
+        if target_date_str:
+            year, month, day = map(int, target_date_str.split('-'))
+        else:
+            now = datetime.utcnow()
+            year, month, day = now.year, now.month, now.day
+        
+        # Use noon UT for transit date
+        transit_jd = swe.julday(year, month, day, 12.0)
+        
+        # Calculate current transit positions
+        transit_planets = {}
+        for planet_key, planet_id in PLANETS.items():
+            if planet_key == 'south_node':
+                continue
+            position = calculate_planet_position(transit_jd, planet_id)
+            if position:
+                transit_planets[planet_key] = {
+                    'name': PLANET_NAMES[planet_key],
+                    **position
+                }
+        
+        # Add south node
+        if 'north_node' in transit_planets:
+            nn_lon = transit_planets['north_node']['longitude']
+            sn_lon = (nn_lon + 180) % 360
+            sn_sign = get_sign(sn_lon)
+            transit_planets['south_node'] = {
+                'name': PLANET_NAMES['south_node'],
+                'longitude': round(sn_lon, 6),
+                'speed': transit_planets['north_node']['speed'],
+                'degree_dms': format_dms(sn_sign['degree']),
+                **sn_sign
+            }
+        
+        # Add natal house placement to transiting planets (which house are they crossing?)
+        natal_houses = None
+        if latitude is not None and longitude is not None:
+            # Calculate natal houses using natal birth location
+            # (same JD doesn't matter for natal house structure — we'd need natal JD, 
+            #  but for "which house does this transit fall in", we use natal house cusps
+            #  which are determined by natal JD; here we use transit JD as approximation
+            #  since the natal house structure changes slowly)
+            natal_houses = calculate_houses(transit_jd, latitude, longitude)
+        
+        if natal_houses:
+            for pk in transit_planets:
+                lon = transit_planets[pk]['longitude']
+                house_num = get_house_for_planet(lon, natal_houses['houses'])
+                transit_planets[pk]['natalHouse'] = house_num
+        
+        # Build transit aspects against natal planets
+        transit_aspects = []
+        
+        for t_key, t_planet in transit_planets.items():
+            t_lon = t_planet['longitude']
+            t_speed = t_planet.get('speed', 0)
+            t_orbs = TRANSIT_ORBS.get(t_key, {'conjunction': 2, 'opposition': 2, 'trine': 2, 'square': 2, 'sextile': 1})
+            
+            for n_key, n_planet in natal_planets_data.items():
+                # natal_planets_data may contain longitude as a float or as a dict
+                if isinstance(n_planet, dict):
+                    n_lon = n_planet.get('longitude')
+                else:
+                    n_lon = n_planet
+                
+                if n_lon is None:
+                    continue
+                
+                n_lon = float(n_lon)
+                n_name = PLANET_NAMES.get(n_key, n_key)
+                
+                diff = abs(t_lon - n_lon)
+                if diff > 180:
+                    diff = 360 - diff
+                
+                for asp in TRANSIT_ASPECT_DEFS:
+                    orb_allowed = t_orbs.get(asp['key'], 2)
+                    orb = abs(diff - asp['angle'])
+                    if orb <= orb_allowed:
+                        applying = is_aspect_applying(t_lon, t_speed, n_lon, 0, asp['angle'])
+                        transit_aspects.append({
+                            'transitPlanet': t_planet['name'],
+                            'transitPlanetKey': t_key,
+                            'natalPlanet': n_name,
+                            'natalPlanetKey': n_key,
+                            'aspect': asp['name'],
+                            'orb': round(orb, 2),
+                            'angle': asp['angle'],
+                            'applying': applying,
+                            'natalHouse': transit_planets[t_key].get('natalHouse'),
+                        })
+        
+        # Sort by orb (tightest first)
+        transit_aspects.sort(key=lambda x: x['orb'])
+        
+        date_str = f"{year}-{month:02d}-{day:02d}"
+        print(f"[transits] Calculated {len(transit_aspects)} transit aspects for {date_str}")
+        
+        return {
+            'transitPlanets': transit_planets,
+            'transitAspects': transit_aspects,
+            'date': date_str,
+        }
+    except Exception as e:
+        print(f"[transits] ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+@app.route('/transits', methods=['POST'])
+def get_transits():
+    """Calculate current transit aspects against a natal chart"""
+    try:
+        data = request.get_json()
+        
+        natal_planets = data.get('natalPlanets', {})
+        target_date = data.get('targetDate', None)
+        latitude = data.get('latitude', None)
+        longitude = data.get('longitude', None)
+        
+        if not natal_planets:
+            return jsonify({'error': 'natalPlanets is required'}), 400
+        
+        if latitude is not None:
+            latitude = float(latitude)
+        if longitude is not None:
+            longitude = float(longitude)
+        
+        result = calculate_transits(natal_planets, target_date, latitude, longitude)
+        
+        if not result:
+            return jsonify({'error': 'Failed to calculate transits'}), 500
+        
+        return jsonify({'success': True, **result})
+        
+    except Exception as e:
+        print(f"[transits] ERROR in endpoint: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/calculate', methods=['POST'])
 def calculate_natal_chart():
     """Calculate natal chart from birth data"""
