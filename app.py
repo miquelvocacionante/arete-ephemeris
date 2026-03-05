@@ -305,7 +305,7 @@ def calculate_aspects(planets, ascendant_lon=None, mc_lon=None):
         'opposition': {'angle': 180, 'orb': 8, 'name': 'Oposición'},
         'trine': {'angle': 120, 'orb': 8, 'name': 'Trígono'},
         'square': {'angle': 90, 'orb': 8, 'name': 'Cuadratura'},
-        'sextile': {'angle': 60, 'orb': 4, 'name': 'Sextil'},
+        'sextile': {'angle': 60, 'orb': 6, 'name': 'Sextil'},  # Increased from 4° to 6° (professional standard)
     }
     
     # Aspects between planets
@@ -563,13 +563,18 @@ def calculate_solar_return(birth_jd, birth_sun_longitude, current_year, sr_latit
             mc_lon=sr_houses['mc']['longitude']
         )
         
-        # Convert SR Julian Day back to calendar date
+        # Convert SR Julian Day back to calendar date using swe.revjul
         sr_date = swe.revjul(sr_jd)
         sr_date_str = f"{int(sr_date[0])}-{int(sr_date[1]):02d}-{int(sr_date[2]):02d}"
-        sr_time_decimal = (sr_jd % 1) * 24
+        # Use revjul's decimal hour (index 3) — NOT (sr_jd % 1) * 24 which is wrong
+        sr_time_decimal = sr_date[3]
         sr_hour = int(sr_time_decimal)
         sr_minute = int((sr_time_decimal - sr_hour) * 60)
         sr_time_str = f"{sr_hour:02d}:{sr_minute:02d}"
+        
+        print(f"[SR] Exact moment: {sr_date_str} {sr_time_str} UT (JD={sr_jd:.6f})")
+        print(f"[SR] Location: lat={sr_latitude}, lon={sr_longitude}")
+        print(f"[SR] Houses: AC={sr_houses['ascendant']['sign']} {sr_houses['ascendant']['degree_dms']}, MC={sr_houses['mc']['sign']} {sr_houses['mc']['degree_dms']}")
         
         return {
             'year': current_year,
