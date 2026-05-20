@@ -843,14 +843,27 @@ def calculate_yearly_transits(natal_planets_data, year, latitude=None, longitude
         for pk in SLOW_PLANET_KEYS:
             pid = SLOW_PLANET_IDS[pk]
             prev_sign = None
-            for month in range(1, 13):
-                jd = swe.julday(year, month, 1, 12.0)
+            prev_jd = None
+            for month in range(1, 14):
+                if month <= 12:
+                    jd = swe.julday(year, month, 1, 12.0)
+                else:
+                    jd = swe.julday(year + 1, 1, 1, 12.0)
                 pos = calculate_planet_position(jd, pid)
                 if not pos:
                     continue
-                if prev_sign and pos['sign'] != prev_sign:
-                    sign_changes.append({'planet': PLANET_NAMES[pk], 'planetKey': pk, 'fromSign': prev_sign, 'toSign': pos['sign'], 'approximateDate': f"{year}-{month:02d}-01"})
+                if prev_sign and pos['sign'] != prev_sign and prev_jd is not None:
+                    exact_iso = _refine_sign_change_date(pid, prev_jd, jd)
+                    sign_changes.append({
+                        'planet': PLANET_NAMES[pk],
+                        'planetKey': pk,
+                        'fromSign': prev_sign,
+                        'toSign': pos['sign'],
+                        'exactDate': exact_iso,
+                        'approximateDate': exact_iso or f"{year}-{min(month,12):02d}-01",
+                    })
                 prev_sign = pos['sign']
+                prev_jd = jd
         print(f"[yearly-transits] Year {year}: {len(transit_aspects)} aspects, {len(sign_changes)} sign changes")
         return {'year': year, 'monthlyPositions': monthly_positions, 'transitAspects': transit_aspects, 'signChanges': sign_changes, 'totalAspects': len(transit_aspects)}
     except Exception as e:
@@ -889,6 +902,27 @@ def _refine_aspect_date(planet_id, natal_lon, aspect_angle, approx_date, year):
             if dist_plus < distance: low_jd = mid_jd
             else: high_jd = mid_jd
         result = swe.revjul(mid_jd)
+        return f"{int(result[0])}-{int(result[1]):02d}-{int(result[2]):02d}"
+    except Exception:
+        return None
+
+
+def _refine_sign_change_date(planet_id, low_jd, high_jd):
+    """Binary-search the exact JD where the planet crosses into a new sign (30-deg boundary)."""
+    try:
+        low = low_jd
+        high = high_jd
+        start_sign = int(swe.calc_ut(low, planet_id, swe.FLG_SWIEPH)[0][0] // 30)
+        for _ in range(40):
+            mid = (low + high) / 2
+            mid_sign = int(swe.calc_ut(mid, planet_id, swe.FLG_SWIEPH)[0][0] // 30)
+            if mid_sign == start_sign:
+                low = mid
+            else:
+                high = mid
+            if (high - low) < (1.0 / 1440.0):  # ~1 minute
+                break
+        result = swe.revjul(high)
         return f"{int(result[0])}-{int(result[1]):02d}-{int(result[2]):02d}"
     except Exception:
         return None
