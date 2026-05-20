@@ -332,6 +332,9 @@ def calculate_aspects(planets, ascendant_lon=None, mc_lon=None):
                 orb = abs(diff - aspect_data['angle'])
                 if orb <= aspect_data['orb']:
                     applying = is_aspect_applying(lon1, speed1, lon2, speed2, aspect_data['angle'])
+                    # Field naming convention:
+                    #   'aspect' = human-readable name ("Trígono", "Oposición") — consumed by AI/frontend
+                    #   'category' = technical classification ("planet-planet", "planet-angle") — internal filtering only
                     aspects.append({
                         'planet1': PLANET_NAMES[planet1_key],
                         'planet2': PLANET_NAMES[planet2_key],
@@ -339,7 +342,7 @@ def calculate_aspects(planets, ascendant_lon=None, mc_lon=None):
                         'orb': round(orb, 2),
                         'angle': aspect_data['angle'],
                         'applying': applying,
-                        'type': 'planet-planet'
+                        'category': 'planet-planet'
                     })
     
     # Aspects to Ascendant
@@ -367,7 +370,7 @@ def calculate_aspects(planets, ascendant_lon=None, mc_lon=None):
                         'orb': round(orb, 2),
                         'angle': aspect_data['angle'],
                         'applying': applying,
-                        'type': 'planet-angle'
+                        'category': 'planet-angle'
                     })
     
     # Aspects to MC
@@ -394,7 +397,7 @@ def calculate_aspects(planets, ascendant_lon=None, mc_lon=None):
                         'orb': round(orb, 2),
                         'angle': aspect_data['angle'],
                         'applying': applying,
-                        'type': 'planet-angle'
+                        'category': 'planet-angle'
                     })
     
     return aspects
@@ -777,6 +780,134 @@ def get_transits():
         
     except Exception as e:
         print(f"[transits] ERROR in endpoint: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+def calculate_yearly_transits(natal_planets_data, year, latitude=None, longitude=None):
+    SLOW_PLANET_KEYS = ['jupiter', 'saturn', 'uranus', 'neptune', 'pluto']
+    SLOW_PLANET_IDS = {'jupiter': swe.JUPITER, 'saturn': swe.SATURN, 'uranus': swe.URANUS, 'neptune': swe.NEPTUNE, 'pluto': swe.PLUTO}
+    try:
+        from datetime import timedelta
+        monthly_positions = []
+        for month in range(1, 13):
+            jd = swe.julday(year, month, 1, 12.0)
+            planets = {}
+            for pk in SLOW_PLANET_KEYS:
+                pos = calculate_planet_position(jd, SLOW_PLANET_IDS[pk])
+                if pos:
+                    planets[pk] = {'name': PLANET_NAMES[pk], **pos}
+            monthly_positions.append({'month': month, 'date': f"{year}-{month:02d}-01", 'planets': planets})
+        transit_aspects = []
+        seen_aspects = set()
+        sample_dates = []
+        for day_offset in range(0, 366, 10):
+            base = datetime(year, 1, 1) + timedelta(days=day_offset)
+            if base.year > year:
+                break
+            sample_dates.append(base)
+        for pk in SLOW_PLANET_KEYS:
+            pid = SLOW_PLANET_IDS[pk]
+            t_orbs = TRANSIT_ORBS.get(pk, {'conjunction': 4, 'opposition': 4, 'trine': 4, 'square': 4, 'sextile': 2})
+            for sample_date in sample_dates:
+                jd = swe.julday(sample_date.year, sample_date.month, sample_date.day, 12.0)
+                t_pos = calculate_planet_position(jd, pid)
+                if not t_pos:
+                    continue
+                t_lon = t_pos['longitude']
+                for n_key, n_planet in natal_planets_data.items():
+                    n_lon = n_planet.get('longitude') if isinstance(n_planet, dict) else n_planet
+                    if n_lon is None:
+                        continue
+                    n_lon = float(n_lon)
+                    diff = abs(t_lon - n_lon)
+                    if diff > 180:
+                        diff = 360 - diff
+                    for asp in TRANSIT_ASPECT_DEFS:
+                        orb_allowed = t_orbs.get(asp['key'], 2)
+                        orb = abs(diff - asp['angle'])
+                        if orb <= orb_allowed * 0.75:
+                            aspect_key = f"{pk}-{asp['key']}-{n_key}"
+                            if aspect_key in seen_aspects:
+                                continue
+                            seen_aspects.add(aspect_key)
+                            exact_date_str = _refine_aspect_date(pid, n_lon, asp['angle'], sample_date, year)
+                            transit_aspects.append({
+                                'transitPlanet': PLANET_NAMES[pk], 'transitPlanetKey': pk,
+                                'natalPlanet': PLANET_NAMES.get(n_key, n_key), 'natalPlanetKey': n_key,
+                                'aspect': asp['name'], 'orb': round(orb, 2), 'angle': asp['angle'],
+                                'exactDate': exact_date_str or sample_date.strftime('%Y-%m-%d'),
+                            })
+        transit_aspects.sort(key=lambda x: x.get('exactDate', ''))
+        sign_changes = []
+        for pk in SLOW_PLANET_KEYS:
+            pid = SLOW_PLANET_IDS[pk]
+            prev_sign = None
+            for month in range(1, 13):
+                jd = swe.julday(year, month, 1, 12.0)
+                pos = calculate_planet_position(jd, pid)
+                if not pos:
+                    continue
+                if prev_sign and pos['sign'] != prev_sign:
+                    sign_changes.append({'planet': PLANET_NAMES[pk], 'planetKey': pk, 'fromSign': prev_sign, 'toSign': pos['sign'], 'approximateDate': f"{year}-{month:02d}-01"})
+                prev_sign = pos['sign']
+        print(f"[yearly-transits] Year {year}: {len(transit_aspects)} aspects, {len(sign_changes)} sign changes")
+        return {'year': year, 'monthlyPositions': monthly_positions, 'transitAspects': transit_aspects, 'signChanges': sign_changes, 'totalAspects': len(transit_aspects)}
+    except Exception as e:
+        print(f"[yearly-transits] ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def _refine_aspect_date(planet_id, natal_lon, aspect_angle, approx_date, year):
+    try:
+        from datetime import timedelta
+        low_date = max(approx_date - timedelta(days=15), datetime(year, 1, 1))
+        high_date = min(approx_date + timedelta(days=15), datetime(year, 12, 31))
+        low_jd = swe.julday(low_date.year, low_date.month, low_date.day, 12.0)
+        high_jd = swe.julday(high_date.year, high_date.month, high_date.day, 12.0)
+        mid_jd = low_jd
+        for _ in range(30):
+            mid_jd = (low_jd + high_jd) / 2
+            t_lon = swe.calc_ut(mid_jd, planet_id, swe.FLG_SWIEPH | swe.FLG_SPEED)[0][0]
+            diff = t_lon - natal_lon
+            if diff > 180: diff -= 360
+            elif diff < -180: diff += 360
+            if aspect_angle == 0: distance = abs(diff)
+            elif aspect_angle == 180: distance = abs(abs(diff) - 180)
+            else: distance = min(abs(diff - aspect_angle), abs(diff + aspect_angle))
+            if distance < 0.01:
+                break
+            t_lon_plus = swe.calc_ut(mid_jd + 0.5, planet_id, swe.FLG_SWIEPH | swe.FLG_SPEED)[0][0]
+            diff_plus = t_lon_plus - natal_lon
+            if diff_plus > 180: diff_plus -= 360
+            elif diff_plus < -180: diff_plus += 360
+            if aspect_angle == 0: dist_plus = abs(diff_plus)
+            elif aspect_angle == 180: dist_plus = abs(abs(diff_plus) - 180)
+            else: dist_plus = min(abs(diff_plus - aspect_angle), abs(diff_plus + aspect_angle))
+            if dist_plus < distance: low_jd = mid_jd
+            else: high_jd = mid_jd
+        result = swe.revjul(mid_jd)
+        return f"{int(result[0])}-{int(result[1]):02d}-{int(result[2]):02d}"
+    except Exception:
+        return None
+
+
+@app.route('/yearly-transits', methods=['POST'])
+def get_yearly_transits():
+    try:
+        data = request.get_json()
+        natal_planets = data.get('natalPlanets', {})
+        year = data.get('year', datetime.utcnow().year)
+        if not natal_planets:
+            return jsonify({'error': 'natalPlanets is required'}), 400
+        result = calculate_yearly_transits(natal_planets, int(year), data.get('latitude'), data.get('longitude'))
+        if not result:
+            return jsonify({'error': 'Failed to calculate yearly transits'}), 500
+        return jsonify({'success': True, **result})
+    except Exception as e:
+        print(f"[yearly-transits] ERROR: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
