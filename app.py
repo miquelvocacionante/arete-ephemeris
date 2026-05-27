@@ -784,6 +784,77 @@ def get_transits():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+
+def calculate_current_positions(target_date_str=None):
+    """
+    Calculate planetary positions for a given date (default: today UTC),
+    without requiring a natal chart. Used by the daily global snapshot cron.
+    """
+    try:
+        if target_date_str:
+            year, month, day = map(int, target_date_str.split('-'))
+        else:
+            now = datetime.utcnow()
+            year, month, day = now.year, now.month, now.day
+
+        jd = swe.julday(year, month, day, 12.0)
+
+        planets = {}
+        for planet_key, planet_id in PLANETS.items():
+            if planet_key == 'south_node':
+                continue
+            position = calculate_planet_position(jd, planet_id)
+            if position:
+                planets[planet_key] = {
+                    'name': PLANET_NAMES[planet_key],
+                    **position,
+                }
+
+        if 'north_node' in planets:
+            nn_lon = planets['north_node']['longitude']
+            sn_lon = (nn_lon + 180) % 360
+            sn_sign = get_sign(sn_lon)
+            planets['south_node'] = {
+                'name': PLANET_NAMES['south_node'],
+                'longitude': round(sn_lon, 6),
+                'speed': planets['north_node']['speed'],
+                'degree_dms': format_dms(sn_sign['degree']),
+                **sn_sign,
+            }
+
+        date_str = f"{year}-{month:02d}-{day:02d}"
+        print(f"[current-positions] Calculated {len(planets)} planets for {date_str}")
+        return {'planets': planets, 'date': date_str}
+    except Exception as e:
+        print(f"[current-positions] ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+@app.route('/current-positions', methods=['POST', 'GET'])
+def get_current_positions():
+    """Return today's (or targetDate's) planetary positions, no natal required."""
+    try:
+        target_date = None
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            target_date = data.get('targetDate')
+        else:
+            target_date = request.args.get('targetDate')
+
+        result = calculate_current_positions(target_date)
+        if not result:
+            return jsonify({'error': 'Failed to calculate current positions'}), 500
+        return jsonify({'success': True, **result})
+    except Exception as e:
+        print(f"[current-positions] ERROR in endpoint: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+
 def calculate_yearly_transits(natal_planets_data, year, latitude=None, longitude=None):
     SLOW_PLANET_KEYS = ['jupiter', 'saturn', 'uranus', 'neptune', 'pluto']
     SLOW_PLANET_IDS = {'jupiter': swe.JUPITER, 'saturn': swe.SATURN, 'uranus': swe.URANUS, 'neptune': swe.NEPTUNE, 'pluto': swe.PLUTO}
