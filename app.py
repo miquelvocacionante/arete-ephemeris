@@ -4,6 +4,52 @@ import swisseph as swe
 from datetime import datetime
 import os
 import pytz
+from aspect_search import (
+    ASPECT_NAMES_ES,
+    find_aspect_passes,
+    find_crossings,
+    dedupe_passes,
+    normalize_aspect,
+    normalize_transit_planet,
+    sample_dates,
+    signed_offset,
+    target_angles,
+    validate_window,
+)
+from cross_aspects import (
+    DEFAULT_TRANSIT_ORBS,
+    ORB_POLICY,
+    PROGRESSION_ORBS,
+    SOLAR_RETURN_ORBS,
+    TRANSIT_ORBS,
+    calculate_cross_aspects,
+)
+from progressions import (
+    PROGRESSED_ASCENDANT_SUPPORTED,
+    years_to_sign_change,
+)
+from solar_return import (
+    SolarReturnSearchError,
+    approximate_return_jd,
+    find_solar_return_jd,
+)
+from engine_integrity import (
+    HouseCalculationError,
+    HousePlacementError,
+    assert_house_placement,
+    ARETE_ASTRO_POLICY,
+    BodyCalculationError,
+    EphemerisEngineError,
+    HouseSystemUnavailableError,
+    REQUIRED_BODIES,
+    TimezoneResolutionError,
+    assert_house_system,
+    assert_required_bodies,
+    is_required_body,
+    placidus_status,
+    resolve_effective_engine,
+    validate_engine,
+)
 
 app = Flask(__name__)
 CORS(app)
@@ -90,18 +136,33 @@ def get_sign(longitude):
     sign_index = int(normalized_lon / 30)
     degree = normalized_lon % 30
     
+    # 'degree' se mantiene a 2 decimales por compatibilidad con los consumidores
+    # existentes; 'degree_exact' conserva la precisión real para DMS y geometría.
     return {
         'sign': SIGNS[sign_index],
-        'degree': round(degree, 2)
+        'degree': round(degree, 2),
+        'degree_exact': round(degree, 6),
     }
 
+def dms_of(sign_info):
+    """DMS a partir del grado exacto: redondear antes perdía hasta 18 segundos."""
+    return format_dms(sign_info.get('degree_exact', sign_info['degree']))
+
+
 def format_dms(decimal_degrees):
-    """Convert decimal degrees to degrees, minutes, seconds format"""
-    d = int(decimal_degrees)
-    m_float = (decimal_degrees - d) * 60
-    m = int(m_float)
-    s = int((m_float - m) * 60)
-    return f"{d}°{m:02d}'{s:02d}\""
+    """
+    Grados, minutos y segundos con redondeo correcto y acarreo.
+
+    Truncar los segundos perdía hasta 1'' en cada posición: 10.008333° son
+    10°00\'30" y salía 10°00\'29". El acarreo importa en los bordes: 59.6" pasa a
+    00" y suma un minuto; 59\'59.6" suma un grado.
+    """
+    sign = -1 if decimal_degrees < 0 else 1
+    value = abs(decimal_degrees)
+    total_seconds = round(value * 3600)
+    d, rest = divmod(total_seconds, 3600)
+    m, sec = divmod(rest, 60)
+    return f"{sign * d if d else 0}°{m:02d}'{sec:02d}\""
 
 def convert_local_to_utc(year, month, day, hour, minute, timezone_str):
     """
@@ -132,8 +193,12 @@ def convert_local_to_utc(year, month, day, hour, minute, timezone_str):
             utc_dt.minute + utc_dt.second / 60.0
         )
     except Exception as e:
-        print(f"[time] ERROR converting timezone: {e}. Using input time as UTC.")
-        return (year, month, day, hour, minute)
+        # Fase 0: nunca interpretar la hora local como UTC. Un fallo aquí podía
+        # desplazar el Ascendente y las casas hasta dos horas en silencio.
+        print(f"[time] ERROR converting timezone '{timezone_str}': {e}")
+        raise TimezoneResolutionError(
+            f"No se ha podido resolver la zona horaria '{timezone_str}': {e}"
+        )
 
 def calculate_julian_day(year, month, day, hour, minute):
     """Calculate Julian Day from UTC time"""
@@ -141,14 +206,42 @@ def calculate_julian_day(year, month, day, hour, minute):
     jd = swe.julday(year, month, day, decimal_time)
     return jd
 
-def calculate_planet_position(julian_day, planet_id):
-    """Calculate planet position using Swiss Ephemeris"""
+REQUESTED_FLAGS = swe.FLG_SWIEPH | swe.FLG_SPEED
+
+def calc_ut_validated(julian_day, planet_id, body_key=None):
+    """
+    Única puerta de entrada a swe.calc_ut (Fase 0).
+
+    Pedir FLG_SWIEPH no garantiza que Swiss lo use: si faltan los ficheros de
+    efemérides cae a Moshier sin lanzar excepción y lo indica solo en los
+    retflags. Todo hecho objetivo del sistema pasa por aquí, no solo la carta
+    natal, para que ningún dato salga de un motor degradado.
+
+    Devuelve (values, provenance) o lanza EphemerisEngineError.
+    """
+    label = body_key or str(planet_id)
+    result = swe.calc_ut(julian_day, planet_id, REQUESTED_FLAGS)
+    values = result[0]
+    retflags = result[1] if len(result) > 1 else None
+    provenance = validate_engine(label, REQUESTED_FLAGS, retflags)
+    return values, provenance
+
+
+def calculate_planet_position(julian_day, planet_id, body_key=None):
+    """
+    Calculate planet position using Swiss Ephemeris.
+
+    Un cuerpo obligatorio que falla es un error de servicio: no puede
+    desaparecer en silencio de una carta, unos tránsitos o una revolución solar.
+    """
+    label = body_key or str(planet_id)
     try:
-        result = swe.calc_ut(julian_day, planet_id, swe.FLG_SWIEPH | swe.FLG_SPEED)
-        longitude = result[0][0]
-        latitude = result[0][1]
-        distance = result[0][2]
-        speed = result[0][3]
+        values, provenance = calc_ut_validated(julian_day, planet_id, label)
+
+        longitude = values[0]
+        latitude = values[1]
+        distance = values[2]
+        speed = values[3]
         
         sign_info = get_sign(longitude)
         
@@ -157,15 +250,32 @@ def calculate_planet_position(julian_day, planet_id):
             'latitude': round(latitude, 6),
             'distance': round(distance, 6),
             'speed': round(speed, 6),
-            'degree_dms': format_dms(sign_info['degree']),
+            'retrograde': speed < 0,
+            'degree_dms': dms_of(sign_info),
+            'provenance': provenance,
             **sign_info
         }
+    except EphemerisEngineError:
+        # Se propaga: no se puede entregar una carta calculada con otro motor.
+        raise
     except Exception as e:
-        print(f"[calc] ERROR calculating planet {planet_id}: {e}")
+        print(f"[calc] ERROR calculating planet {label}: {e}")
+        if is_required_body(label):
+            raise BodyCalculationError(
+                f"No se ha podido calcular el cuerpo obligatorio '{label}': {e}"
+            )
         return None
 
+
 def calculate_houses(julian_day, latitude, longitude):
-    """Calculate houses using Placidus system"""
+    """
+    Casas por Placidus.
+
+    Fase 0: Swiss Ephemeris no informa de qué sistema ha usado realmente y
+    sustituye Placidus cerca de los polos. Bloqueamos esas latitudes antes de
+    calcular en lugar de entregar casas etiquetadas como Placidus sin serlo.
+    """
+    house_system = assert_house_system(latitude)
     try:
         # 'P' = Placidus, 'K' = Koch, 'E' = Equal, etc.
         houses, ascmc = swe.houses(julian_day, latitude, longitude, b'P')
@@ -184,7 +294,7 @@ def calculate_houses(julian_day, latitude, longitude):
                 'house': house_names[i],
                 'house_number': i + 1,
                 'cusp': round(cusp, 6),
-                'degree_dms': format_dms(sign_info['degree']),
+                'degree_dms': dms_of(sign_info),
                 **sign_info
             })
         
@@ -201,27 +311,38 @@ def calculate_houses(julian_day, latitude, longitude):
             'houses': house_list,
             'ascendant': {
                 'longitude': round(ascendant, 6),
-                'degree_dms': format_dms(asc_sign['degree']),
+                'degree_dms': dms_of(asc_sign),
                 **asc_sign
             },
             'mc': {
                 'longitude': round(mc, 6),
-                'degree_dms': format_dms(mc_sign['degree']),
+                'degree_dms': dms_of(mc_sign),
                 **mc_sign
             },
             'vertex': {
                 'longitude': round(vertex, 6),
-                'degree_dms': format_dms(vertex_sign['degree']),
+                'degree_dms': dms_of(vertex_sign),
                 **vertex_sign
-            }
+            },
+            'houseSystem': house_system
         }
+    except HouseSystemUnavailableError:
+        raise
     except Exception as e:
+        # Un fallo de casas no puede degradarse a "sin datos": sin Ascendente ni
+        # cúspides no hay carta que entregar.
         print(f"[calc] ERROR calculating houses: {e}")
-        return None
+        raise HouseCalculationError(f"Swiss Ephemeris no ha podido calcular las casas: {e}")
 
 def get_house_for_planet(planet_longitude, houses):
     """Determine which house a planet is in based on its longitude"""
-    cusps = [h['cusp'] for h in houses]
+    cusps = [h['cusp'] for h in houses or []]
+    if len(cusps) != 12:
+        raise HousePlacementError(
+            f"Se esperaban 12 cúspides para situar la longitud {planet_longitude}, "
+            f"se han recibido {len(cusps)}."
+        )
+
     
     for i in range(12):
         cusp_start = cusps[i]
@@ -234,8 +355,10 @@ def get_house_for_planet(planet_longitude, houses):
         else:
             if cusp_start <= planet_longitude < cusp_end:
                 return i + 1
-    
-    return 1  # Default to house 1 if not found
+
+    # Antes se devolvía Casa 1 por defecto: una casa inventada que llegaba al
+    # informe como si fuese un hecho calculado.
+    return assert_house_placement(None, planet_longitude)
 
 def normalize_angle(angle):
     """Normalize angle to -180 to +180 range"""
@@ -402,99 +525,249 @@ def calculate_aspects(planets, ascendant_lon=None, mc_lon=None):
     
     return aspects
 
-@app.route('/health', methods=['GET'])
-def health():
-    """Health check endpoint"""
-    return jsonify({'status': 'healthy', 'service': 'swiss-ephemeris'})
+def _engine_diagnostics():
+    """
+    Diagnóstico verificable del motor (Fase 0).
 
-@app.route('/debug/ephe', methods=['GET'])
-def debug_ephe():
-    """Debug endpoint to check ephemeris files"""
+    Comprueba, con una fecha conocida (2000-01-01 12:00 UT), qué motor usa
+    realmente Swiss Ephemeris para el Sol y para Quirón, y si los ficheros de
+    efemérides están presentes.
+    """
     ephe_path = _resolve_ephe_path()
     files = []
     if os.path.isdir(ephe_path):
-        files = sorted(os.listdir(ephe_path))
-    
-    # Test Chiron calculation
-    chiron_test = None
-    try:
-        # Test with a known date (2000-01-01 12:00 UT)
-        jd = swe.julday(2000, 1, 1, 12.0)
-        result = swe.calc_ut(jd, swe.CHIRON, swe.FLG_SWIEPH | swe.FLG_SPEED)
-        chiron_test = {
-            'status': 'success',
-            'longitude': round(result[0][0], 6),
-            'sign': get_sign(result[0][0])['sign']
-        }
-    except Exception as e:
-        chiron_test = {
-            'status': 'error',
-            'message': str(e)
-        }
-    
-    return jsonify({
+        files = sorted(f for f in os.listdir(ephe_path) if not f.startswith('.'))
+
+    jd = swe.julday(2000, 1, 1, 12.0)
+    bodies = {}
+    for key, planet_id in (('sun', swe.SUN), ('chiron', swe.CHIRON)):
+        try:
+            # Única excepción permitida a calc_ut_validated: el diagnóstico debe
+            # observar los retflags de un motor degradado sin abortar, que es
+            # justo lo que se está midiendo. Todo cálculo funcional pasa por
+            # calc_ut_validated.
+            result = swe.calc_ut(jd, planet_id, REQUESTED_FLAGS)
+            retflags = result[1] if len(result) > 1 else None
+            engine = resolve_effective_engine(retflags)
+            bodies[key] = {
+                'status': 'ok' if engine == 'swiss' else 'degraded',
+                'engine': engine,
+                'requested_flags': int(REQUESTED_FLAGS),
+                'retflags': retflags,
+                'longitude': round(result[0][0], 6),
+            }
+        except Exception as e:
+            bodies[key] = {'status': 'error', 'message': str(e)}
+
+    healthy = all(b.get('status') == 'ok' for b in bodies.values())
+
+    return {
+        'healthy': healthy,
+        'policy': ARETE_ASTRO_POLICY,
         'ephe_path': ephe_path,
         'files': files,
         'file_count': len(files),
-        'chiron_test': chiron_test,
-        'expected_files': ['seas_18.se1', 'sepl_18.se1']
-    })
+        'expected_files': ['seas_18.se1', 'sepl_18.se1'],
+        'required_bodies': list(REQUIRED_BODIES),
+        'bodies': bodies,
+        'swisseph_version': getattr(swe, 'version', 'unknown'),
+    }
 
-def calculate_progressed_moon(birth_jd, current_date_str):
+
+def _effective_engine_of(planets):
+    """Motor efectivo común a todos los cuerpos de la carta, o 'mixed'."""
+    engines = {
+        p['provenance']['engine']
+        for p in planets.values()
+        if isinstance(p, dict) and isinstance(p.get('provenance'), dict)
+    }
+    if not engines:
+        return 'unknown'
+    return engines.pop() if len(engines) == 1 else 'mixed'
+
+
+@app.route('/health', methods=['GET'])
+def health():
     """
-    Calculate Secondary Progression for the Moon.
-    Secondary Progression: 1 day after birth = 1 year of life
-    
-    Args:
-        birth_jd: Julian Day of birth
-        current_date_str: Current date in YYYY-MM-DD format
-    
-    Returns:
-        dict with progressed Moon position and info
+    Health check.
+
+    Fase 0: el estado refleja el motor real. Se mantiene el código 200 para no
+    provocar reinicios en cascada del contenedor (cada cálculo ya falla por sí
+    mismo si el motor está degradado), pero el estado deja de mentir.
     """
     try:
-        # Parse current date
-        current_year, current_month, current_day = map(int, current_date_str.split('-'))
-        current_jd = swe.julday(current_year, current_month, current_day, 12.0)
-        
-        # Calculate years since birth
-        days_since_birth = current_jd - birth_jd
-        years_since_birth = days_since_birth / 365.25
-        
-        # Progressed date: birth + (years as days)
-        # Each year of life = 1 day after birth
-        progressed_jd = birth_jd + years_since_birth
-        
-        # Calculate Moon position at progressed date
-        moon_position = calculate_planet_position(progressed_jd, swe.MOON)
-        
-        if not moon_position:
-            return None
-        
-        # Calculate when Moon will change sign (approximate)
-        moon_speed_per_year = 12.2  # Moon moves ~12.2 degrees per progressed year
-        degrees_to_next_sign = 30 - (moon_position['longitude'] % 30)
-        years_to_sign_change = degrees_to_next_sign / moon_speed_per_year
-        
-        # Previous sign
-        prev_sign_index = (SIGNS.index(moon_position['sign']) - 1) % 12
-        
-        return {
-            'name': 'Luna Progresada',
-            'longitude': moon_position['longitude'],
-            'sign': moon_position['sign'],
-            'degree': moon_position['degree'],
-            'degree_dms': moon_position['degree_dms'],
-            'previousSign': SIGNS[prev_sign_index],
-            'yearsToSignChange': round(years_to_sign_change, 1),
-            'progressedJulianDay': round(progressed_jd, 6),
-            'yearsSinceBirth': round(years_since_birth, 2)
+        diagnostics = _engine_diagnostics()
+        healthy = diagnostics['healthy']
+        summary = {
+            'engine': {
+                'healthy': healthy,
+                'ephePath': diagnostics['ephe_path'],
+                'fileCount': diagnostics['file_count'],
+                'bodies': {k: v.get('engine', v.get('status')) for k, v in diagnostics['bodies'].items()},
+                'swissephVersion': diagnostics['swisseph_version'],
+            }
         }
     except Exception as e:
-        print(f"[calc] ERROR calculating progressed Moon: {e}")
+        healthy = False
+        summary = {'engine': {'healthy': False, 'error': str(e)}}
+
+    return jsonify({
+        'status': 'healthy' if healthy else 'degraded',
+        'service': 'swiss-ephemeris',
+        **summary,
+    })
+
+
+@app.route('/health/engine', methods=['GET'])
+def health_engine():
+    """Health check del motor: efemérides, motor efectivo y capacidad de calcular Quirón"""
+    diagnostics = _engine_diagnostics()
+    return jsonify(diagnostics), (200 if diagnostics['healthy'] else 503)
+
+
+@app.route('/debug/ephe', methods=['GET'])
+def debug_ephe():
+    """Debug endpoint to check ephemeris files (compatibilidad con la respuesta anterior)"""
+    diagnostics = _engine_diagnostics()
+    chiron = diagnostics['bodies'].get('chiron', {})
+    return jsonify({
+        'ephe_path': diagnostics['ephe_path'],
+        'files': diagnostics['files'],
+        'file_count': diagnostics['file_count'],
+        'chiron_test': {
+            'status': 'success' if chiron.get('status') == 'ok' else 'error',
+            'longitude': chiron.get('longitude'),
+            'sign': get_sign(chiron['longitude'])['sign'] if chiron.get('longitude') is not None else None,
+            'engine': chiron.get('engine'),
+            'message': chiron.get('message'),
+        },
+        'expected_files': diagnostics['expected_files'],
+        'engine': diagnostics,
+    })
+
+def build_natal_points(planets, houses_data=None):
+    """Puntos natales utilizables como objetivo de aspectos entre cartas."""
+    points = {
+        key: {'name': planet.get('name', key), 'longitude': planet['longitude']}
+        for key, planet in (planets or {}).items()
+        if isinstance(planet, dict) and planet.get('longitude') is not None
+    }
+    if houses_data:
+        if houses_data.get('ascendant'):
+            points['ascendant'] = {'name': 'Ascendente', 'longitude': houses_data['ascendant']['longitude']}
+        if houses_data.get('mc'):
+            points['mc'] = {'name': 'Medio Cielo', 'longitude': houses_data['mc']['longitude']}
+    return points
+
+
+PROGRESSED_BODIES = (
+    ('sun', swe.SUN, 'Sol Progresado'),
+    ('moon', swe.MOON, 'Luna Progresada'),
+    ('mercury', swe.MERCURY, 'Mercurio Progresado'),
+    ('venus', swe.VENUS, 'Venus Progresado'),
+    ('mars', swe.MARS, 'Marte Progresado'),
+)
+
+
+def _progressed_julian_day(birth_jd, current_date_str):
+    """Un día después del nacimiento equivale a un año de vida."""
+    current_year, current_month, current_day = map(int, current_date_str.split('-'))
+    current_jd = swe.julday(current_year, current_month, current_day, 12.0)
+    years_since_birth = (current_jd - birth_jd) / 365.25
+    return birth_jd + years_since_birth, years_since_birth
+
+
+def calculate_secondary_progressions(birth_jd, current_date_str, natal_points=None):
+    """
+    Progresiones secundarias deterministas: Sol, Luna, Mercurio, Venus y Marte
+    sobre una única fecha progresada, con sus aspectos a la carta natal.
+
+    El Ascendente progresado queda oficialmente no soportado: hay varias
+    convenciones astrológicas y el motor no decide por nosotros cuál es la
+    correcta. Antes que una precisión falsa, preferimos declararlo ausente.
+    """
+    try:
+        progressed_jd, years_since_birth = _progressed_julian_day(birth_jd, current_date_str)
+
+        points = {}
+        for key, planet_id, display_name in PROGRESSED_BODIES:
+            position = calculate_planet_position(progressed_jd, planet_id, body_key=key)
+            if not position:
+                continue
+            points[key] = {'name': display_name, **position}
+
+        if 'moon' not in points:
+            return None
+
+        # Aspectos progresado -> natal sobre longitudes absolutas: sin esto el
+        # modelo solo veía signo y grado, y de ahí salió la falsa "conjunción"
+        # del caso Marta Alí (Virgo 1°34\' y Cáncer 1°22\' son un sextil).
+        aspects = calculate_cross_aspects(
+            {k: {'name': v['name'], 'longitude': v['longitude']} for k, v in points.items()},
+            natal_points or {},
+            PROGRESSION_ORBS,
+            source_suffix='',
+        )
+
+        def moon_longitude_at(jd):
+            return calc_ut_validated(jd, swe.MOON, 'moon')[0][0]
+
+        # Cambio de signo buscado con el motor. Antes se dividía por una
+        # velocidad media de 12,2°/año y se presentaba como fecha real.
+        years_to_change = years_to_sign_change(moon_longitude_at, progressed_jd)
+
+        return {
+            'yearsToSignChange': years_to_change,
+            'progressedJulianDay': round(progressed_jd, 6),
+            'yearsSinceBirth': round(years_since_birth, 2),
+            'points': points,
+            'aspects': aspects,
+            'orbPolicy': {'version': ORB_POLICY['version'], 'maxOrb': PROGRESSION_ORBS['conjunction']},
+            'progressedAscendant': {
+                'supported': PROGRESSED_ASCENDANT_SUPPORTED,
+                'reason': 'Sin convención única validada; Areté no lo calcula.',
+            },
+        }
+    except (EphemerisEngineError, BodyCalculationError, HouseSystemUnavailableError,
+            HouseCalculationError, HousePlacementError):
+        raise
+    except Exception as e:
+        print(f"[calc] ERROR calculating secondary progressions: {e}")
         return None
 
-def calculate_solar_return(birth_jd, birth_sun_longitude, current_year, sr_latitude, sr_longitude):
+
+def progressed_moon_from(progressions):
+    """
+    Salida de compatibilidad `progressedMoon`, derivada de las progresiones.
+
+    No recalcula nada: los consumidores existentes siguen recibiendo la misma
+    forma, pero de una única fuente.
+    """
+    if not progressions:
+        return None
+    moon = progressions['points'].get('moon')
+    if not moon:
+        return None
+
+    prev_sign_index = (SIGNS.index(moon['sign']) - 1) % 12
+    moon_aspects = [a for a in progressions['aspects'] if a['sourceKey'] == 'moon']
+
+    return {
+        'name': 'Luna Progresada',
+        'longitude': moon['longitude'],
+        'aspects': moon_aspects,
+        'orbPolicy': progressions['orbPolicy'],
+        'sign': moon['sign'],
+        'degree': moon['degree'],
+        'degree_dms': moon['degree_dms'],
+        'previousSign': SIGNS[prev_sign_index],
+        'yearsToSignChange': progressions.get('yearsToSignChange'),
+        'progressedJulianDay': progressions['progressedJulianDay'],
+        'yearsSinceBirth': progressions['yearsSinceBirth'],
+    }
+
+
+def calculate_solar_return(birth_jd, birth_sun_longitude, current_year, sr_latitude, sr_longitude, natal_points=None):
     """
     Calculate Solar Return chart for a given year.
     Solar Return is when the Sun returns to its exact natal position.
@@ -510,47 +783,32 @@ def calculate_solar_return(birth_jd, birth_sun_longitude, current_year, sr_latit
         dict with Solar Return chart data
     """
     try:
-        # Start searching from January 1 of the target year
-        search_jd = swe.julday(current_year, 1, 1, 12.0)
-        
-        # Find when Sun returns to natal position (within 1 degree tolerance to start)
-        # Binary search for exact moment
-        low_jd = search_jd
-        high_jd = search_jd + 366  # Search within one year
-        
-        target_longitude = birth_sun_longitude
-        
-        # Iterative refinement
-        for _ in range(50):  # Max iterations
-            mid_jd = (low_jd + high_jd) / 2
-            sun_pos = swe.calc_ut(mid_jd, swe.SUN, swe.FLG_SWIEPH)[0][0]
-            
-            # Normalize difference
-            diff = sun_pos - target_longitude
-            if diff > 180:
-                diff -= 360
-            elif diff < -180:
-                diff += 360
-            
-            if abs(diff) < 0.0001:  # Very precise
-                break
-            
-            if diff > 0:
-                high_jd = mid_jd
-            else:
-                low_jd = mid_jd
-        
-        sr_jd = mid_jd
-        
+        # El retorno se busca alrededor del cumpleaños en el año pedido, no
+        # biseccionando un año entero sobre una función angular discontinua:
+        # ese algoritmo podía elegir el retorno equivocado para cumpleaños de
+        # principios de enero.
+        birth_calendar = swe.revjul(birth_jd)
+        birth_month, birth_day = int(birth_calendar[1]), int(birth_calendar[2])
+        approx_jd = approximate_return_jd(swe.julday, birth_month, birth_day, current_year, 12.0)
+
+        def sun_longitude_at(jd):
+            return calc_ut_validated(jd, swe.SUN, 'sun')[0][0]
+
+        sr_jd = find_solar_return_jd(sun_longitude_at, approx_jd, birth_sun_longitude)
+
         # Calculate houses for SR location
         sr_houses = calculate_houses(sr_jd, sr_latitude, sr_longitude)
         if not sr_houses:
             return None
         
-        # Calculate all planets at SR moment
+        # Calculate all planets at SR moment. El Nodo Sur no se calcula con
+        # calc_ut (su planet_id es None): se deriva del Nodo Norte, igual que en
+        # la carta natal y en los tránsitos.
         sr_planets = {}
         for planet_key, planet_id in PLANETS.items():
-            position = calculate_planet_position(sr_jd, planet_id)
+            if planet_key == 'south_node':
+                continue
+            position = calculate_planet_position(sr_jd, planet_id, body_key=planet_key)
             if position:
                 house_num = get_house_for_planet(position['longitude'], sr_houses['houses'])
                 sr_planets[planet_key] = {
@@ -558,6 +816,20 @@ def calculate_solar_return(birth_jd, birth_sun_longitude, current_year, sr_latit
                     'house': house_num,
                     **position
                 }
+
+        if 'north_node' in sr_planets:
+            nn = sr_planets['north_node']
+            sn_lon = (nn['longitude'] + 180) % 360
+            sn_sign = get_sign(sn_lon)
+            sr_planets['south_node'] = {
+                'name': PLANET_NAMES['south_node'],
+                'house': get_house_for_planet(sn_lon, sr_houses['houses']),
+                'longitude': round(sn_lon, 6),
+                'speed': nn['speed'],
+                'retrograde': nn.get('retrograde', False),
+                'degree_dms': dms_of(sn_sign),
+                **sn_sign
+            }
         
         # Calculate aspects in SR
         sr_aspects = calculate_aspects(
@@ -579,8 +851,22 @@ def calculate_solar_return(birth_jd, birth_sun_longitude, current_year, sr_latit
         print(f"[SR] Location: lat={sr_latitude}, lon={sr_longitude}")
         print(f"[SR] Houses: AC={sr_houses['ascendant']['sign']} {sr_houses['ascendant']['degree_dms']}, MC={sr_houses['mc']['sign']} {sr_houses['mc']['degree_dms']}")
         
+        # Fase 2: los aspectos internos de la RS ya se calculaban pero se
+        # descartaban al construir la respuesta, y los aspectos RS -> natal no
+        # existían. Ambos se entregan ahora como hecho determinista.
+        sr_natal_aspects = calculate_cross_aspects(
+            {k: {'name': v.get('name', k), 'longitude': v['longitude']} for k, v in sr_planets.items()},
+            natal_points or {},
+            SOLAR_RETURN_ORBS,
+            default_orbs=DEFAULT_TRANSIT_ORBS,
+            source_suffix='RS',
+        )
+
         return {
             'year': current_year,
+            'aspects': sr_aspects,
+            'natalAspects': sr_natal_aspects,
+            'orbPolicy': {'version': ORB_POLICY['version'], 'solarReturnToNatal': 'transit_orbs'},
             'exactMoment': {
                 'julianDay': round(sr_jd, 6),
                 'date': sr_date_str,
@@ -595,6 +881,11 @@ def calculate_solar_return(birth_jd, birth_sun_longitude, current_year, sr_latit
                 'longitude': sr_longitude
             }
         }
+    except (EphemerisEngineError, BodyCalculationError, HouseSystemUnavailableError,
+            HouseCalculationError, HousePlacementError, SolarReturnSearchError):
+        # Fase 0: un motor degradado, un cuerpo obligatorio ausente o un fallo
+        # de casas nunca se degradan a "sin resultado"; se propagan al endpoint.
+        raise
     except Exception as e:
         print(f"[calc] ERROR calculating Solar Return: {e}")
         import traceback
@@ -604,22 +895,6 @@ def calculate_solar_return(birth_jd, birth_sun_longitude, current_year, sr_latit
 
 # ============ TRANSIT CALCULATION ============
 
-# Orbs for transit aspects (tighter than natal)
-TRANSIT_ORBS = {
-    'sun':       {'conjunction': 1, 'opposition': 1, 'trine': 1, 'square': 1, 'sextile': 1},
-    'moon':      {'conjunction': 1, 'opposition': 1, 'trine': 1, 'square': 1, 'sextile': 1},
-    'mercury':   {'conjunction': 2, 'opposition': 2, 'trine': 2, 'square': 2, 'sextile': 1},
-    'venus':     {'conjunction': 2, 'opposition': 2, 'trine': 2, 'square': 2, 'sextile': 1},
-    'mars':      {'conjunction': 2, 'opposition': 2, 'trine': 2, 'square': 2, 'sextile': 1},
-    'jupiter':   {'conjunction': 4, 'opposition': 4, 'trine': 4, 'square': 4, 'sextile': 2},
-    'saturn':    {'conjunction': 4, 'opposition': 4, 'trine': 4, 'square': 4, 'sextile': 2},
-    'uranus':    {'conjunction': 4, 'opposition': 4, 'trine': 4, 'square': 4, 'sextile': 2},
-    'neptune':   {'conjunction': 4, 'opposition': 4, 'trine': 4, 'square': 4, 'sextile': 2},
-    'pluto':     {'conjunction': 4, 'opposition': 4, 'trine': 4, 'square': 4, 'sextile': 2},
-    'north_node':{'conjunction': 2, 'opposition': 2, 'trine': 2, 'square': 2, 'sextile': 1},
-    'chiron':    {'conjunction': 3, 'opposition': 3, 'trine': 3, 'square': 3, 'sextile': 2},
-}
-
 TRANSIT_ASPECT_DEFS = [
     {'key': 'conjunction', 'angle': 0,   'name': 'Conjunción'},
     {'key': 'opposition',  'angle': 180, 'name': 'Oposición'},
@@ -628,16 +903,40 @@ TRANSIT_ASPECT_DEFS = [
     {'key': 'sextile',     'angle': 60,  'name': 'Sextil'},
 ]
 
-def calculate_transits(natal_planets_data, target_date_str=None, latitude=None, longitude=None):
+def normalize_natal_cusps(natal_houses):
+    """
+    Acepta las cúspides natales tal y como las guarda la carta y devuelve la
+    forma que espera get_house_for_planet, o None si no son utilizables.
+    """
+    if not natal_houses:
+        return None
+    cusps = []
+    for item in natal_houses:
+        if isinstance(item, dict):
+            value = item.get('cusp', item.get('degree'))
+        else:
+            value = item
+        try:
+            cusps.append({'cusp': float(value) % 360.0})
+        except (TypeError, ValueError):
+            return None
+    return cusps if len(cusps) == 12 else None
+
+
+def calculate_transits(natal_planets_data, target_date_str=None, natal_houses=None):
     """
     Calculate current transiting planets and their aspects to natal chart.
-    
+
+    Las cúspides natales dependen del momento y del lugar de nacimiento y no se
+    pueden reconstruir con el día juliano del tránsito: antes se hacía como
+    "aproximación" y producía una casa natal falsa. Ahora `natalHouse` solo
+    aparece si el llamante aporta las cúspides natales reales.
+
     Args:
         natal_planets_data: dict of natal planets with longitude values
         target_date_str: date string YYYY-MM-DD (default: today UTC)
-        latitude: for natal house placement of transiting planets
-        longitude: for natal house placement of transiting planets
-    
+        natal_houses: lista de 12 cúspides natales reales (o None para omitir la casa)
+
     Returns:
         dict with transitPlanets, transitAspects, date
     """
@@ -656,7 +955,7 @@ def calculate_transits(natal_planets_data, target_date_str=None, latitude=None, 
         for planet_key, planet_id in PLANETS.items():
             if planet_key == 'south_node':
                 continue
-            position = calculate_planet_position(transit_jd, planet_id)
+            position = calculate_planet_position(transit_jd, planet_id, body_key=planet_key)
             if position:
                 transit_planets[planet_key] = {
                     'name': PLANET_NAMES[planet_key],
@@ -672,25 +971,17 @@ def calculate_transits(natal_planets_data, target_date_str=None, latitude=None, 
                 'name': PLANET_NAMES['south_node'],
                 'longitude': round(sn_lon, 6),
                 'speed': transit_planets['north_node']['speed'],
-                'degree_dms': format_dms(sn_sign['degree']),
+                'degree_dms': dms_of(sn_sign),
                 **sn_sign
             }
         
-        # Add natal house placement to transiting planets (which house are they crossing?)
-        natal_houses = None
-        if latitude is not None and longitude is not None:
-            # Calculate natal houses using natal birth location
-            # (same JD doesn't matter for natal house structure — we'd need natal JD, 
-            #  but for "which house does this transit fall in", we use natal house cusps
-            #  which are determined by natal JD; here we use transit JD as approximation
-            #  since the natal house structure changes slowly)
-            natal_houses = calculate_houses(transit_jd, latitude, longitude)
-        
-        if natal_houses:
+        # Casa natal del tránsito: solo con cúspides natales reales aportadas
+        # por el llamante. Sin ellas se omite el dato en lugar de estimarlo.
+        natal_cusps = normalize_natal_cusps(natal_houses)
+        if natal_cusps:
             for pk in transit_planets:
                 lon = transit_planets[pk]['longitude']
-                house_num = get_house_for_planet(lon, natal_houses['houses'])
-                transit_planets[pk]['natalHouse'] = house_num
+                transit_planets[pk]['natalHouse'] = get_house_for_planet(lon, natal_cusps)
         
         # Build transit aspects against natal planets
         transit_aspects = []
@@ -745,6 +1036,10 @@ def calculate_transits(natal_planets_data, target_date_str=None, latitude=None, 
             'transitAspects': transit_aspects,
             'date': date_str,
         }
+    except (EphemerisEngineError, BodyCalculationError, HouseSystemUnavailableError):
+        # Fase 0: un motor degradado o un cuerpo obligatorio ausente nunca se
+        # degradan a "sin resultado"; se propagan hasta el endpoint.
+        raise
     except Exception as e:
         print(f"[transits] ERROR: {e}")
         import traceback
@@ -760,24 +1055,26 @@ def get_transits():
         
         natal_planets = data.get('natalPlanets', {})
         target_date = data.get('targetDate', None)
-        latitude = data.get('latitude', None)
-        longitude = data.get('longitude', None)
-        
+        # latitude/longitude ya no sirven para estimar casas natales: si el
+        # llamante quiere natalHouse, debe enviar las cúspides natales reales.
+        natal_houses = data.get('natalHouses')
+
         if not natal_planets:
             return jsonify({'error': 'natalPlanets is required'}), 400
-        
-        if latitude is not None:
-            latitude = float(latitude)
-        if longitude is not None:
-            longitude = float(longitude)
-        
-        result = calculate_transits(natal_planets, target_date, latitude, longitude)
+
+        result = calculate_transits(natal_planets, target_date, natal_houses)
         
         if not result:
             return jsonify({'error': 'Failed to calculate transits'}), 500
         
         return jsonify({'success': True, **result})
         
+    except HouseSystemUnavailableError as e:
+        return jsonify({'error': str(e), 'code': 'house_system_unavailable'}), 422
+    except EphemerisEngineError as e:
+        return jsonify({'error': str(e), 'code': 'ephemeris_engine_mismatch'}), 503
+    except BodyCalculationError as e:
+        return jsonify({'error': str(e), 'code': 'required_body_missing'}), 503
     except Exception as e:
         print(f"[transits] ERROR in endpoint: {e}")
         import traceback
@@ -803,7 +1100,7 @@ def calculate_current_positions(target_date_str=None):
         for planet_key, planet_id in PLANETS.items():
             if planet_key == 'south_node':
                 continue
-            position = calculate_planet_position(jd, planet_id)
+            position = calculate_planet_position(jd, planet_id, body_key=planet_key)
             if position:
                 planets[planet_key] = {
                     'name': PLANET_NAMES[planet_key],
@@ -818,13 +1115,17 @@ def calculate_current_positions(target_date_str=None):
                 'name': PLANET_NAMES['south_node'],
                 'longitude': round(sn_lon, 6),
                 'speed': planets['north_node']['speed'],
-                'degree_dms': format_dms(sn_sign['degree']),
+                'degree_dms': dms_of(sn_sign),
                 **sn_sign,
             }
 
         date_str = f"{year}-{month:02d}-{day:02d}"
         print(f"[current-positions] Calculated {len(planets)} planets for {date_str}")
         return {'planets': planets, 'date': date_str}
+    except (EphemerisEngineError, BodyCalculationError, HouseSystemUnavailableError):
+        # Fase 0: un motor degradado o un cuerpo obligatorio ausente nunca se
+        # degradan a "sin resultado"; se propagan hasta el endpoint.
+        raise
     except Exception as e:
         print(f"[current-positions] ERROR: {e}")
         import traceback
@@ -847,6 +1148,12 @@ def get_current_positions():
         if not result:
             return jsonify({'error': 'Failed to calculate current positions'}), 500
         return jsonify({'success': True, **result})
+    except HouseSystemUnavailableError as e:
+        return jsonify({'error': str(e), 'code': 'house_system_unavailable'}), 422
+    except EphemerisEngineError as e:
+        return jsonify({'error': str(e), 'code': 'ephemeris_engine_mismatch'}), 503
+    except BodyCalculationError as e:
+        return jsonify({'error': str(e), 'code': 'required_body_missing'}), 503
     except Exception as e:
         print(f"[current-positions] ERROR in endpoint: {e}")
         import traceback
@@ -865,7 +1172,7 @@ def calculate_yearly_transits(natal_planets_data, year, latitude=None, longitude
             jd = swe.julday(year, month, 1, 12.0)
             planets = {}
             for pk in SLOW_PLANET_KEYS:
-                pos = calculate_planet_position(jd, SLOW_PLANET_IDS[pk])
+                pos = calculate_planet_position(jd, SLOW_PLANET_IDS[pk], body_key=pk)
                 if pos:
                     planets[pk] = {'name': PLANET_NAMES[pk], **pos}
             monthly_positions.append({'month': month, 'date': f"{year}-{month:02d}-01", 'planets': planets})
@@ -882,7 +1189,7 @@ def calculate_yearly_transits(natal_planets_data, year, latitude=None, longitude
             t_orbs = TRANSIT_ORBS.get(pk, {'conjunction': 4, 'opposition': 4, 'trine': 4, 'square': 4, 'sextile': 2})
             for sample_date in sample_dates:
                 jd = swe.julday(sample_date.year, sample_date.month, sample_date.day, 12.0)
-                t_pos = calculate_planet_position(jd, pid)
+                t_pos = calculate_planet_position(jd, pid, body_key=pk)
                 if not t_pos:
                     continue
                 t_lon = t_pos['longitude']
@@ -920,7 +1227,7 @@ def calculate_yearly_transits(natal_planets_data, year, latitude=None, longitude
                     jd = swe.julday(year, month, 1, 12.0)
                 else:
                     jd = swe.julday(year + 1, 1, 1, 12.0)
-                pos = calculate_planet_position(jd, pid)
+                pos = calculate_planet_position(jd, pid, body_key=pk)
                 if not pos:
                     continue
                 if prev_sign and pos['sign'] != prev_sign and prev_jd is not None:
@@ -937,6 +1244,10 @@ def calculate_yearly_transits(natal_planets_data, year, latitude=None, longitude
                 prev_jd = jd
         print(f"[yearly-transits] Year {year}: {len(transit_aspects)} aspects, {len(sign_changes)} sign changes")
         return {'year': year, 'monthlyPositions': monthly_positions, 'transitAspects': transit_aspects, 'signChanges': sign_changes, 'totalAspects': len(transit_aspects)}
+    except (EphemerisEngineError, BodyCalculationError, HouseSystemUnavailableError):
+        # Fase 0: un motor degradado o un cuerpo obligatorio ausente nunca se
+        # degradan a "sin resultado"; se propagan hasta el endpoint.
+        raise
     except Exception as e:
         print(f"[yearly-transits] ERROR: {e}")
         import traceback
@@ -954,7 +1265,7 @@ def _refine_aspect_date(planet_id, natal_lon, aspect_angle, approx_date, year):
         mid_jd = low_jd
         for _ in range(30):
             mid_jd = (low_jd + high_jd) / 2
-            t_lon = swe.calc_ut(mid_jd, planet_id, swe.FLG_SWIEPH | swe.FLG_SPEED)[0][0]
+            t_lon = calc_ut_validated(mid_jd, planet_id, 'transit')[0][0]
             diff = t_lon - natal_lon
             if diff > 180: diff -= 360
             elif diff < -180: diff += 360
@@ -963,7 +1274,7 @@ def _refine_aspect_date(planet_id, natal_lon, aspect_angle, approx_date, year):
             else: distance = min(abs(diff - aspect_angle), abs(diff + aspect_angle))
             if distance < 0.01:
                 break
-            t_lon_plus = swe.calc_ut(mid_jd + 0.5, planet_id, swe.FLG_SWIEPH | swe.FLG_SPEED)[0][0]
+            t_lon_plus = calc_ut_validated(mid_jd + 0.5, planet_id, 'transit')[0][0]
             diff_plus = t_lon_plus - natal_lon
             if diff_plus > 180: diff_plus -= 360
             elif diff_plus < -180: diff_plus += 360
@@ -974,6 +1285,8 @@ def _refine_aspect_date(planet_id, natal_lon, aspect_angle, approx_date, year):
             else: high_jd = mid_jd
         result = swe.revjul(mid_jd)
         return f"{int(result[0])}-{int(result[1]):02d}-{int(result[2]):02d}"
+    except EphemerisEngineError:
+        raise
     except Exception:
         return None
 
@@ -983,10 +1296,10 @@ def _refine_sign_change_date(planet_id, low_jd, high_jd):
     try:
         low = low_jd
         high = high_jd
-        start_sign = int(swe.calc_ut(low, planet_id, swe.FLG_SWIEPH)[0][0] // 30)
+        start_sign = int(calc_ut_validated(low, planet_id, 'transit')[0][0] // 30)
         for _ in range(40):
             mid = (low + high) / 2
-            mid_sign = int(swe.calc_ut(mid, planet_id, swe.FLG_SWIEPH)[0][0] // 30)
+            mid_sign = int(calc_ut_validated(mid, planet_id, 'transit')[0][0] // 30)
             if mid_sign == start_sign:
                 low = mid
             else:
@@ -995,8 +1308,97 @@ def _refine_sign_change_date(planet_id, low_jd, high_jd):
                 break
         result = swe.revjul(high)
         return f"{int(result[0])}-{int(result[1]):02d}-{int(result[2]):02d}"
+    except EphemerisEngineError:
+        raise
     except Exception:
         return None
+
+
+# ============ BÚSQUEDA DE PERFECCIONES DE ASPECTO (Fase B) ============
+
+# Paso de muestreo por planeta: suficientemente fino para no saltarse un cruce.
+_SEARCH_STEP_DAYS = {
+    'moon': 0.2, 'sun': 2.0, 'mercury': 1.0, 'venus': 1.0, 'mars': 2.0,
+    'jupiter': 4.0, 'saturn': 4.0, 'uranus': 6.0, 'neptune': 6.0, 'pluto': 6.0,
+}
+
+
+def _jd_of(dt):
+    """Día juliano preservando la fracción horaria (necesaria para el refinado)."""
+    hours = dt.hour + dt.minute / 60.0 + dt.second / 3600.0
+    return swe.julday(dt.year, dt.month, dt.day, hours)
+
+
+def _state_at_factory(planet_id):
+    """Adaptador astronómico: única parte que depende de Swiss Ephemeris."""
+    def state_at(moment):
+        values, _ = calc_ut_validated(_jd_of(moment), planet_id, 'transit')
+        return values[0], values[3]
+    return state_at
+
+
+def search_transit_aspect(transit_planet_key, natal_longitude, aspect_key, start, end):
+    """Devuelve todas las pasadas exactas del aspecto dentro de la ventana."""
+    return find_aspect_passes(
+        _state_at_factory(PLANETS[transit_planet_key]),
+        natal_longitude,
+        aspect_key,
+        start,
+        end,
+        _SEARCH_STEP_DAYS.get(transit_planet_key, 2.0),
+    )
+
+
+
+
+@app.route('/search-transit-aspect', methods=['POST'])
+def get_transit_aspect_search():
+    """Busca las fechas exactas en que un tránsito perfecciona un aspecto natal."""
+    try:
+        data = request.get_json(silent=True) or {}
+        transit_planet = normalize_transit_planet(data.get('transitPlanet'))
+        aspect = normalize_aspect(data.get('aspect'))
+        if not transit_planet:
+            return jsonify({'error': 'transitPlanet no soportado'}), 400
+        if not aspect:
+            return jsonify({'error': 'aspect no soportado'}), 400
+
+        natal_longitude = data.get('natalLongitude')
+        try:
+            natal_longitude = float(natal_longitude) % 360.0
+        except (TypeError, ValueError):
+            return jsonify({'error': 'natalLongitude es obligatorio y numérico'}), 400
+
+        start, end, window_error = validate_window(data.get('startDate'), data.get('endDate'))
+        if window_error:
+            return jsonify({'error': window_error}), 400
+
+        passes = search_transit_aspect(transit_planet, natal_longitude, aspect, start, end)
+        return jsonify({
+            'success': True,
+            'transitPlanet': PLANET_NAMES[transit_planet],
+            'transitPlanetKey': transit_planet,
+            'natalPlanet': data.get('natalPlanet'),
+            'natalLongitude': round(natal_longitude, 6),
+            'aspect': ASPECT_NAMES_ES[aspect],
+            'aspectKey': aspect,
+            'startDate': start.strftime('%Y-%m-%d'),
+            'endDate': end.strftime('%Y-%m-%d'),
+            'passes': passes,
+            'totalPasses': len(passes),
+        })
+    except HouseSystemUnavailableError as e:
+        return jsonify({'error': str(e), 'code': 'house_system_unavailable'}), 422
+    except EphemerisEngineError as e:
+        return jsonify({'error': str(e), 'code': 'ephemeris_engine_mismatch'}), 503
+    except BodyCalculationError as e:
+        return jsonify({'error': str(e), 'code': 'required_body_missing'}), 503
+    except Exception as e:
+        print(f"[search-transit-aspect] ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
 
 
 @app.route('/yearly-transits', methods=['POST'])
@@ -1011,6 +1413,12 @@ def get_yearly_transits():
         if not result:
             return jsonify({'error': 'Failed to calculate yearly transits'}), 500
         return jsonify({'success': True, **result})
+    except HouseSystemUnavailableError as e:
+        return jsonify({'error': str(e), 'code': 'house_system_unavailable'}), 422
+    except EphemerisEngineError as e:
+        return jsonify({'error': str(e), 'code': 'ephemeris_engine_mismatch'}), 503
+    except BodyCalculationError as e:
+        return jsonify({'error': str(e), 'code': 'required_body_missing'}), 503
     except Exception as e:
         print(f"[yearly-transits] ERROR: {e}")
         import traceback
@@ -1073,7 +1481,7 @@ def calculate_natal_chart():
             if planet_key == 'south_node':
                 continue
                 
-            position = calculate_planet_position(julian_day, planet_id)
+            position = calculate_planet_position(julian_day, planet_id, body_key=planet_key)
             if position:
                 # Add house placement
                 house_num = get_house_for_planet(position['longitude'], houses_data['houses'])
@@ -1101,13 +1509,19 @@ def calculate_natal_chart():
                 'latitude': round(-north_node_position['latitude'], 6),  # Opposite latitude
                 'distance': north_node_position['distance'],
                 'speed': north_node_position['speed'],  # Same speed as north node
-                'degree_dms': format_dms(south_sign_info['degree']),
+                'retrograde': north_node_position.get('retrograde', False),
+                'degree_dms': dms_of(south_sign_info),
                 **south_sign_info
             }
         
         print(f"[calc] Calculated {len(planets)}/{len(PLANETS)} planets successfully")
         if failed_planets:
             print(f"[calc] FAILED planets: {failed_planets}")
+
+        # Fase 0: un cuerpo obligatorio (en especial Quirón) no puede desaparecer
+        # en silencio y dejar una carta incompleta.
+        assert_required_bodies(planets.keys())
+
         
         # Calculate aspects (including to angles)
         aspects = calculate_aspects(
@@ -1136,26 +1550,50 @@ def calculate_natal_chart():
             'aspects': aspects,
             'calculatedAt': datetime.utcnow().isoformat() + 'Z',
             'precision': 'high',
-            'ephemeris': 'Swiss Ephemeris'
+            'ephemeris': 'Swiss Ephemeris',
+            # Fase 0: trazabilidad del motor que produjo realmente cada posición.
+            'provenance': {
+                'policy': ARETE_ASTRO_POLICY,
+                'ephePath': EPHE_PATH,
+                'swissephVersion': getattr(swe, 'version', 'unknown'),
+                'requestedFlags': int(REQUESTED_FLAGS),
+                'engine': _effective_engine_of(planets),
+                'nodeConvention': ARETE_ASTRO_POLICY['node'],
+                'orbPolicy': ORB_POLICY,
+                'houseSystem': houses_data.get('houseSystem'),
+                'bodies': {
+                    k: v.get('provenance')
+                    for k, v in planets.items()
+                    if isinstance(v, dict) and v.get('provenance')
+                },
+            }
         }
+
         
-        # Calculate Progressed Moon (Secondary Progression)
+        natal_points = build_natal_points(planets, houses_data)
+
+        # Progresiones secundarias (Sol, Luna, Mercurio, Venus y Marte) con sus
+        # aspectos a la carta natal. `progressedMoon` se deriva de aquí.
         if include_progressions:
             current_date = datetime.utcnow().strftime('%Y-%m-%d')
-            progressed_moon = calculate_progressed_moon(julian_day, current_date)
-            if progressed_moon:
-                chart_data['progressedMoon'] = progressed_moon
-                print(f"[calc] Progressed Moon: {progressed_moon['sign']} {progressed_moon['degree_dms']}")
+            progressions = calculate_secondary_progressions(julian_day, current_date, natal_points)
+            if progressions:
+                chart_data['secondaryProgressions'] = progressions
+                progressed_moon = progressed_moon_from(progressions)
+                if progressed_moon:
+                    chart_data['progressedMoon'] = progressed_moon
+                    print(f"[calc] Progressed Moon: {progressed_moon['sign']} {progressed_moon['degree_dms']}")
         
         # Calculate Solar Return for specified year
         if include_solar_return and planets.get('sun'):
             natal_sun_longitude = planets['sun']['longitude']
             solar_return = calculate_solar_return(
-                julian_day, 
-                natal_sun_longitude, 
+                julian_day,
+                natal_sun_longitude,
                 int(sr_year),
                 float(sr_latitude),
-                float(sr_longitude)
+                float(sr_longitude),
+                natal_points,
             )
             if solar_return:
                 chart_data['solarReturn'] = solar_return
@@ -1163,6 +1601,27 @@ def calculate_natal_chart():
         
         return jsonify({'success': True, 'chartData': chart_data})
         
+    except TimezoneResolutionError as e:
+        print(f"[calc] ERROR zona horaria: {e}")
+        return jsonify({'error': str(e), 'code': 'timezone_unresolved'}), 400
+    except HouseSystemUnavailableError as e:
+        print(f"[calc] ERROR sistema de casas: {e}")
+        return jsonify({'error': str(e), 'code': 'house_system_unavailable'}), 422
+    except HouseCalculationError as e:
+        print(f"[calc] ERROR cálculo de casas: {e}")
+        return jsonify({'error': str(e), 'code': 'house_calculation_failed'}), 503
+    except HousePlacementError as e:
+        print(f"[calc] ERROR posición en casas: {e}")
+        return jsonify({'error': str(e), 'code': 'house_placement_failed'}), 500
+    except SolarReturnSearchError as e:
+        print(f"[calc] ERROR retorno solar: {e}")
+        return jsonify({'error': str(e), 'code': 'solar_return_search_failed'}), 500
+    except EphemerisEngineError as e:
+        print(f"[calc] ERROR motor de efemérides: {e}")
+        return jsonify({'error': str(e), 'code': 'ephemeris_engine_mismatch'}), 503
+    except BodyCalculationError as e:
+        print(f"[calc] ERROR cuerpo obligatorio: {e}")
+        return jsonify({'error': str(e), 'code': 'required_body_missing'}), 503
     except Exception as e:
         print(f"[calc] ERROR: {str(e)}")
         import traceback
