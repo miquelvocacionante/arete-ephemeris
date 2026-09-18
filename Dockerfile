@@ -15,14 +15,14 @@ COPY cross_aspects.py ./
 COPY engine_integrity.py ./
 COPY progressions.py ./
 COPY solar_return.py ./
+COPY download_ephemeris.py ./
 COPY verify_swiss_real.py ./
 
-COPY ephe ./ephe
-
-# Release gate: never build an image that silently degrades to Moshier.
-# Required files in /app/ephe:
-#   sepl_18.se1, semo_18.se1, seas_18.se1
-RUN EPHE_PATH=/app/ephe python verify_swiss_real.py
+# Descarga reproducible desde el repositorio público oficial de Swiss
+# y validación real del motor. Si cualquiera de las dos cosas falla,
+# Railway no obtiene una imagen desplegable.
+RUN python download_ephemeris.py \
+    && EPHE_PATH=/app/ephe python verify_swiss_real.py
 
 EXPOSE 8080
 
