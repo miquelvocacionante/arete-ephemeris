@@ -1,0 +1,51 @@
+name: Ephemeris CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - fix/swiss-engine-integrity
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download pinned Swiss ephemerides
+        run: python download_ephemeris.py
+
+      - name: Compile Python modules
+        run: |
+          python -m py_compile             app.py             aspect_search.py             cross_aspects.py             engine_integrity.py             progressions.py             solar_return.py             download_ephemeris.py             verify_swiss_real.py
+
+      - name: Run engine tests
+        run: |
+          python test_engine_integrity.py
+          python test_cross_aspects.py
+          python test_progressions.py
+          python test_solar_return.py
+          python test_aspect_search.py
+          python test_app_integrity.py
+
+      - name: Verify real Swiss engine
+        run: EPHE_PATH="$GITHUB_WORKSPACE/ephe" python verify_swiss_real.py
+
+      - name: Build Railway image
+        run: docker build -t arete-ephemeris:test .
