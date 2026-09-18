@@ -26,4 +26,7 @@ RUN python download_ephemeris.py \
 
 EXPOSE 8080
 
-CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --timeout 120 --access-logfile - --error-logfile - app:app"]
+# Se vuelve a validar al arrancar: si Railway sobrescribe EPHE_PATH o el
+# filesystem/runtime no coincide con la imagen validada, el servicio falla
+# cerrado antes de aceptar tráfico.
+CMD ["sh", "-c", "python verify_swiss_real.py && exec gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --timeout 120 --access-logfile - --error-logfile - app:app"]
