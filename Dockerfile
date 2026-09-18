@@ -1,20 +1,32 @@
 FROM python:3.11-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    EPHE_PATH=/app/ephe
+
 WORKDIR /app
 
-# Install dependencies
-COPY requirements.txt .
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application
-COPY app.py .
+COPY app.py ./
+COPY aspect_search.py ./
+COPY cross_aspects.py ./
+COPY engine_integrity.py ./
+COPY progressions.py ./
+COPY solar_return.py ./
+COPY download_ephemeris.py ./
+COPY verify_swiss_real.py ./
 
-# Copy Swiss Ephemeris data files (needed for asteroids like Chiron)
-# Keep at least one file in the folder (e.g. .gitkeep) so Docker COPY doesn't fail.
-COPY ephe ./ephe
+# Descarga reproducible desde el repositorio público oficial de Swiss
+# y validación real del motor. Si cualquiera de las dos cosas falla,
+# Railway no obtiene una imagen desplegable.
+RUN python download_ephemeris.py \
+    && EPHE_PATH=/app/ephe python verify_swiss_real.py
 
-# Expose port
 EXPOSE 8080
 
-# Run with gunicorn
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--timeout", "120", "app:app"]
+# Se vuelve a validar al arrancar: si Railway sobrescribe EPHE_PATH o el
+# filesystem/runtime no coincide con la imagen validada, el servicio falla
+# cerrado antes de aceptar tráfico.
+CMD ["sh", "-c", "python verify_swiss_real.py && exec gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --timeout 120 --access-logfile - --error-logfile - app:app"]
