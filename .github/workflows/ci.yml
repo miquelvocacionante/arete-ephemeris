@@ -32,8 +32,16 @@ jobs:
         run: python download_ephemeris.py
 
       - name: Compile Python modules
-        run: |
-          python -m py_compile             app.py             aspect_search.py             cross_aspects.py             engine_integrity.py             progressions.py             solar_return.py             download_ephemeris.py             verify_swiss_real.py
+        run: >
+          python -m py_compile
+          app.py
+          aspect_search.py
+          cross_aspects.py
+          engine_integrity.py
+          progressions.py
+          solar_return.py
+          download_ephemeris.py
+          verify_swiss_real.py
 
       - name: Run engine tests
         run: |
@@ -49,3 +57,18 @@ jobs:
 
       - name: Build Railway image
         run: docker build -t arete-ephemeris:test .
+
+      - name: Smoke-test container startup and health
+        run: |
+          docker run -d --rm --name arete-ephemeris-ci -e PORT=8080 -p 18080:8080 arete-ephemeris:test
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:18080/health/engine > /tmp/health.json; then
+              cat /tmp/health.json
+              docker stop arete-ephemeris-ci
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs arete-ephemeris-ci
+          docker stop arete-ephemeris-ci || true
+          exit 1
