@@ -1,20 +1,29 @@
 FROM python:3.11-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    EPHE_PATH=/app/ephe
+
 WORKDIR /app
 
-# Install dependencies
-COPY requirements.txt .
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application
-COPY app.py .
+COPY app.py ./
+COPY aspect_search.py ./
+COPY cross_aspects.py ./
+COPY engine_integrity.py ./
+COPY progressions.py ./
+COPY solar_return.py ./
+COPY verify_swiss_real.py ./
 
-# Copy Swiss Ephemeris data files (needed for asteroids like Chiron)
-# Keep at least one file in the folder (e.g. .gitkeep) so Docker COPY doesn't fail.
 COPY ephe ./ephe
 
-# Expose port
+# Release gate: never build an image that silently degrades to Moshier.
+# Required files in /app/ephe:
+#   sepl_18.se1, semo_18.se1, seas_18.se1
+RUN EPHE_PATH=/app/ephe python verify_swiss_real.py
+
 EXPOSE 8080
 
-# Run with gunicorn
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--timeout", "120", "app:app"]
+CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --timeout 120 --access-logfile - --error-logfile - app:app"]
