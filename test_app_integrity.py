@@ -148,7 +148,6 @@ check("velocidad positiva no marca retrógrado", directo["retrograde"] is False)
 
 print("\n[4] Cuerpo obligatorio ausente en /calculate")
 reset()
-STATE["failing_bodies"] = {fake.CHIRON}
 client = service.app.test_client()
 payload = {
     "birthDate": "1985-07-20",
@@ -169,6 +168,9 @@ check("segundos fraccionarios se aceptan sin romper el endpoint", resp.status_co
 resp = client.post("/calculate", json={**payload, "birthTime": "14:99:00"})
 check("hora imposible devuelve 400", resp.status_code == 400)
 check("hora imposible tiene código explícito", resp.get_json().get("code") == "invalid_birth_time")
+
+reset()
+STATE["failing_bodies"] = {fake.CHIRON}
 resp = client.post("/calculate", json=payload)
 body = resp.get_json()
 check("Quirón ausente devuelve error de servicio", resp.status_code == 503)
