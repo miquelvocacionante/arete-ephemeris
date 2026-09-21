@@ -163,8 +163,14 @@ print("\n[4a] Contrato de hora de nacimiento")
 reset()
 resp = client.post("/calculate", json={**payload, "birthTime": "14:30:00"})
 check("HH:MM:SS de Postgres se acepta", resp.status_code == 200)
+base_jd = resp.get_json()["chartData"]["birthInfo"]["julianDay"]
 resp = client.post("/calculate", json={**payload, "birthTime": "14:30:45.500000"})
 check("segundos fraccionarios se aceptan sin romper el endpoint", resp.status_code == 200)
+seconds_jd = resp.get_json()["chartData"]["birthInfo"]["julianDay"]
+check(
+    "los segundos se conservan en el día juliano",
+    abs((seconds_jd - base_jd) - 45.5 / 86400.0) < 2e-6,
+)
 resp = client.post("/calculate", json={**payload, "birthTime": "14:99:00"})
 check("hora imposible devuelve 400", resp.status_code == 400)
 check("hora imposible tiene código explícito", resp.get_json().get("code") == "invalid_birth_time")
