@@ -166,7 +166,7 @@ def format_dms(decimal_degrees):
     return f"{sign * d if d else 0}°{m:02d}'{sec:02d}\""
 
 _BIRTH_TIME_RE = re.compile(
-    r"^(?P<hour>\\d{1,2}):(?P<minute>\\d{2})(?::(?P<second>\\d{2})(?:\\.(?P<fraction>\\d{1,6}))?)?$"
+    r"^(?P<hour>\d{1,2}):(?P<minute>\d{2})(?::(?P<second>\d{2})(?:\.(?P<fraction>\d{1,6}))?)?$"
 )
 
 
