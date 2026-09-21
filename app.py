@@ -3,6 +3,7 @@ from flask_cors import CORS
 import swisseph as swe
 from datetime import datetime
 import os
+import re
 import pytz
 from aspect_search import (
     ASPECT_NAMES_ES,
@@ -164,33 +165,72 @@ def format_dms(decimal_degrees):
     m, sec = divmod(rest, 60)
     return f"{sign * d if d else 0}°{m:02d}'{sec:02d}\""
 
-def convert_local_to_utc(year, month, day, hour, minute, timezone_str):
+_BIRTH_TIME_RE = re.compile(
+    r"^(?P<hour>\\d{1,2}):(?P<minute>\\d{2})(?::(?P<second>\\d{2})(?:\\.(?P<fraction>\\d{1,6}))?)?$"
+)
+
+
+def parse_birth_time(value):
+    """
+    Parse the local birth time contract accepted by /calculate.
+
+    PostgreSQL TIME values commonly arrive as HH:MM:SS, while older clients
+    send HH:MM. Fractional seconds are also valid. The motor owns this temporal
+    contract so every caller gets the same validation and precision.
+    """
+    if not isinstance(value, str):
+        raise ValueError("birthTime debe ser una cadena HH:MM, HH:MM:SS o HH:MM:SS.ffffff.")
+
+    match = _BIRTH_TIME_RE.fullmatch(value.strip())
+    if not match:
+        raise ValueError("birthTime debe tener formato HH:MM, HH:MM:SS o HH:MM:SS.ffffff.")
+
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute"))
+    second = int(match.group("second") or 0)
+    if hour > 23 or minute > 59 or second > 59:
+        raise ValueError("birthTime contiene una hora imposible.")
+
+    fraction = match.group("fraction") or ""
+    microsecond = int(fraction.ljust(6, "0")) if fraction else 0
+    return hour, minute, second, microsecond
+
+
+def convert_local_to_utc(
+    year, month, day, hour, minute, timezone_str, second=0, microsecond=0
+):
     """
     Convert local time to UTC.
-    
+
     Args:
-        year, month, day, hour, minute: Local time components
+        year, month, day, hour, minute, second, microsecond: Local time components
         timezone_str: IANA timezone string (e.g., 'Europe/Madrid')
-    
+
     Returns:
-        tuple: (year, month, day, hour, minute) in UTC
+        tuple: (year, month, day, hour, minute) in UTC; minute may be fractional
+        so seconds are preserved in the Julian Day.
     """
     try:
         # Create a timezone-aware datetime in the local timezone
         local_tz = pytz.timezone(timezone_str)
-        local_dt = local_tz.localize(datetime(year, month, day, hour, minute))
-        
+        local_dt = local_tz.localize(
+            datetime(year, month, day, hour, minute, second, microsecond)
+        )
+
         # Convert to UTC
         utc_dt = local_dt.astimezone(pytz.UTC)
-        
-        print(f"[time] Local: {local_dt.strftime('%Y-%m-%d %H:%M %Z')} -> UTC: {utc_dt.strftime('%Y-%m-%d %H:%M %Z')}")
-        
+
+        print(
+            f"[time] Local: {local_dt.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+            f"-> UTC: {utc_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+        )
+
         return (
             utc_dt.year,
             utc_dt.month,
             utc_dt.day,
             utc_dt.hour,
-            utc_dt.minute + utc_dt.second / 60.0
+            utc_dt.minute + utc_dt.second / 60.0 + utc_dt.microsecond / 60_000_000.0
         )
     except Exception as e:
         # Fase 0: nunca interpretar la hora local como UTC. Un fallo aquí podía
@@ -1434,7 +1474,7 @@ def calculate_natal_chart():
         
         # Parse input
         birth_date = data.get('birthDate')  # YYYY-MM-DD
-        birth_time = data.get('birthTime')  # HH:MM (LOCAL TIME)
+        birth_time = data.get('birthTime')  # HH:MM[:SS[.ffffff]] (LOCAL TIME)
         latitude = float(data.get('latitude'))
         longitude = float(data.get('longitude'))
         timezone = data.get('timezone', 'UTC')
@@ -1448,14 +1488,28 @@ def calculate_natal_chart():
         
         # Parse date and time (LOCAL)
         year, month, day = map(int, birth_date.split('-'))
-        hour, minute = map(int, birth_time.split(':'))
-        
-        print(f"[calc] Input LOCAL time: {year}-{month:02d}-{day:02d} {hour:02d}:{minute:02d} ({timezone})")
+        try:
+            hour, minute, second, microsecond = parse_birth_time(birth_time)
+        except ValueError as e:
+            return jsonify({'error': str(e), 'code': 'invalid_birth_time'}), 400
+
+        fractional = f".{microsecond:06d}" if microsecond else ""
+        print(
+            f"[calc] Input LOCAL time: {year}-{month:02d}-{day:02d} "
+            f"{hour:02d}:{minute:02d}:{second:02d}{fractional} ({timezone})"
+        )
         print(f"[calc] Coordinates: lat={latitude}, lon={longitude}")
         
         # Convert local time to UTC for ephemeris calculations
         utc_year, utc_month, utc_day, utc_hour, utc_minute = convert_local_to_utc(
-            year, month, day, hour, minute, timezone
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            timezone,
+            second=second,
+            microsecond=microsecond,
         )
         
         print(f"[calc] Converted to UTC: {utc_year}-{utc_month:02d}-{utc_day:02d} {int(utc_hour):02d}:{utc_minute:05.2f}")
