@@ -159,6 +159,16 @@ payload = {
     "includeProgressions": False,
     "includeSolarReturn": False,
 }
+
+print("\n[4a] Contrato de hora de nacimiento")
+reset()
+resp = client.post("/calculate", json={**payload, "birthTime": "14:30:00"})
+check("HH:MM:SS de Postgres se acepta", resp.status_code == 200)
+resp = client.post("/calculate", json={**payload, "birthTime": "14:30:45.500000"})
+check("segundos fraccionarios se aceptan sin romper el endpoint", resp.status_code == 200)
+resp = client.post("/calculate", json={**payload, "birthTime": "14:99:00"})
+check("hora imposible devuelve 400", resp.status_code == 400)
+check("hora imposible tiene código explícito", resp.get_json().get("code") == "invalid_birth_time")
 resp = client.post("/calculate", json=payload)
 body = resp.get_json()
 check("Quirón ausente devuelve error de servicio", resp.status_code == 503)
