@@ -105,6 +105,13 @@ PLANETS = {
     'north_node': swe.TRUE_NODE,
     'south_node': None,  # Calculated as opposite of North Node
     'chiron': swe.CHIRON,
+    # Lilith media (Luna Negra media): apogeo medio de la órbita lunar, sin las
+    # oscilaciones de la Lilith verdadera/osculante (swe.OSCU_APOG). Es la
+    # convención estándar en astrología cuando se dice "Lilith" sin más
+    # precisión, y la que usa por defecto la mayoría del software astrológico.
+    # No es un cuerpo obligatorio (no está en REQUIRED_BODIES): si algún día
+    # falla, la carta se sigue entregando sin ella en vez de bloquearse.
+    'black_moon': swe.MEAN_APOG,
 }
 
 PLANET_NAMES = {
@@ -121,6 +128,7 @@ PLANET_NAMES = {
     'north_node': 'Nodo Norte',
     'south_node': 'Nodo Sur',
     'chiron': 'Quirón',
+    'black_moon': 'Lilith',
 }
 
 SIGNS = [
