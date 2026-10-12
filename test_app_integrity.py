@@ -33,6 +33,7 @@ fake = types.ModuleType("swisseph")
 fake.SUN, fake.MOON, fake.MERCURY, fake.VENUS, fake.MARS = 0, 1, 2, 3, 4
 fake.JUPITER, fake.SATURN, fake.URANUS, fake.NEPTUNE, fake.PLUTO = 5, 6, 7, 8, 9
 fake.TRUE_NODE, fake.MEAN_NODE, fake.CHIRON = 11, 10, 15
+fake.MEAN_APOG, fake.OSCU_APOG = 12, 13  # Lilith media / verdadera (ids reales de pyswisseph)
 fake.FLG_SWIEPH, fake.FLG_SPEED, fake.FLG_MOSEPH = FLG_SWIEPH, FLG_SPEED, FLG_MOSEPH
 fake.version = "fake-2.10"
 
